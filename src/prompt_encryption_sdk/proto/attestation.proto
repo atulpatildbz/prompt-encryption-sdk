@@ -1,0 +1,56 @@
+syntax = "proto3";
+
+package prompt_encryption_sdk;
+
+service AttestedTls {
+  // AttestConnection performs the post-handshake attestation.
+  rpc AttestConnection(AttestConnectionRequest)
+      returns (AttestConnectionResponse);
+}
+
+// VerifierType defines the supported attestation mechanisms.
+enum VerifierType {
+  VERIFIER_TYPE_UNSPECIFIED = 0;
+  // Google Cloud Attestation (GCA)
+  GCA = 1;
+}
+
+message AttestConnectionRequest {
+  // A list of verifiers that the server must be endorsed by.
+  repeated VerifierType required_verifier_type = 1;
+  // A random nonce for generating unique TLS session material.
+  bytes nonce = 2;
+}
+
+// GcaTrustBundle contains the materials needed to verify a GCA-based
+// attestation.
+message GcaTrustBundle {
+  // The signed JWT attestation token from GCA.
+  string attestation_token = 1;
+}
+
+// AttestationEvidence contains the proof of endorsement from a single RoT.
+message AttestationEvidence {
+  // The type of evidence, must be one requested by the client.
+  VerifierType verifier_type = 1;
+  // The attestation materials for the RoT.
+  oneof trust_bundle {
+    GcaTrustBundle gca_bundle = 2;
+  }
+}
+
+message EcdsaP256PublicKey {
+  bytes key_bytes = 1;
+}
+
+// AttestConnectionResponse is sent by the server to the client. It is sent only
+// if the server can satisfy all of the client's required RoTs.
+message AttestConnectionResponse {
+  // A list of evidence, one for each RoT requested.
+  repeated AttestationEvidence evidence = 1;
+  // The common public key endorsed by all evidence bundles.
+  EcdsaP256PublicKey instance_public_key = 2;
+  // signature over a value derived from the TLS session's master secret.
+  // This binds the attestation to this specific TLS session.
+  bytes session_signature = 3;
+}
