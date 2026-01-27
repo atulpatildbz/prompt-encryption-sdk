@@ -16,3 +16,8 @@ CS_DEFAULT_JWKS_URI: str = (
 
 # Default Issuer
 CS_DEFAULT_ISSUER: str = "https://confidentialcomputing.googleapis.com"
+
+# TLS Exported Keying Material Parameters
+EKM_LABEL: bytes = b"attested-inference-tls-ekm"
+EKM_LENGTH: int = 32
+NONCE_LENGTH: int = 32
