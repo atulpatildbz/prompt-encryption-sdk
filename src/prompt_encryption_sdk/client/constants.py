@@ -20,4 +20,8 @@ CS_DEFAULT_ISSUER: str = "https://confidentialcomputing.googleapis.com"
 # TLS Exported Keying Material Parameters
 EKM_LABEL: bytes = b"attested-inference-tls-ekm"
 EKM_LENGTH: int = 32
+
+# Default revalidation interval in seconds (55 minutes).
+# GCA tokens typically expire in 1 hour, so we revalidate slightly before.
+DEFAULT_REVALIDATION_TIMEOUT: int = 3300
 NONCE_LENGTH: int = 32
