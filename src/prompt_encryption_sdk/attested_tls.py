@@ -6,17 +6,25 @@ import http.client
 import json
 import os
 import pathlib
+import random
 import socket
-from types import TracebackType
+import types
+import threading
+import time
 from typing import Any, Protocol
+
 from absl import logging
+from attested_confidential_inference.proto import attestation_pb2
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
+import jwt
 
 TEE_SERVER_SOCKET_PATH = "/run/container_launcher/teeserver.sock"
 TOKEN_ENDPOINT = "/v1/token"
 DEFAULT_AUDIENCE = "https://sts.google.com"
 TOKEN_TYPE = "OIDC"
+DEFAULT_REFRESH_MULTIPLIER = 0.9
+DEFAULT_RETRY_INTERVAL_SECONDS = 10
 
 
 class _FileWriter(Protocol):
@@ -49,7 +57,7 @@ class UnixSocketConnection(http.client.HTTPConnection):
       self,
       exc_type: type[BaseException] | None,
       exc_val: BaseException | None,
-      exc_tb: TracebackType | None,
+      exc_tb: types.TracebackType | None,
   ) -> None:
     self.close()
 
@@ -133,6 +141,196 @@ class KeyManager:
     return self._read_file_fn(self.public_key_path)
 
 
+class TokenManager:
+  """A manager for refreshing of keys and attestation tokens."""
+
+  def __init__(
+      self,
+      *,
+      key_manager: KeyManager,
+      jitter_window_seconds: float = 60.0,
+      rng: random.Random | None = None,
+      attestation_token_path: pathlib.Path = pathlib.Path(
+          "attestation_token.txt"
+      ),
+  ):
+    self.key_manager = key_manager
+    self.attestation_token_path = attestation_token_path
+    self.jitter_window_seconds = jitter_window_seconds
+    self.rng = rng if rng is not None else random.Random()
+    self._stop_event = threading.Event()
+    self._thread = threading.Thread(target=self._run, daemon=True)
+    self._lock = threading.Lock()
+
+  def __repr__(self):
+    return (
+        f"TokenManager(key_manager={self.key_manager!r},"
+        f" attestation_token_path={self.attestation_token_path!r},"
+        f" jitter_window_seconds={self.jitter_window_seconds!r}"
+    )
+
+  def refresh(self) -> None:
+    """Refreshes the public key and attestation token and saves them to files."""
+    logging.info("Refreshing keys and attestation token...")
+    with self._lock:
+      self.key_manager.generate_key_pair()
+      public_key = self.key_manager.get_current_public_key()
+      public_key_fingerprint = calculate_fingerprint(public_key)
+
+      attestation_token = get_custom_token_bytes(
+          audience=DEFAULT_AUDIENCE,
+          token_type=TOKEN_TYPE,
+          nonces=[public_key_fingerprint],
+      )
+      _write_file(self.attestation_token_path, attestation_token, 0o644)
+    logging.info("Refresh complete.")
+
+  def get_public_key(self) -> bytes:
+    """Gets the current public key from the key manager."""
+    with self._lock:
+      return self.key_manager.get_current_public_key()
+
+  def get_attestation_token(self) -> bytes:
+    """Gets the current attestation token from its file."""
+    with self._lock:
+      try:
+        with open(self.attestation_token_path, "rb") as f:
+          return f.read()
+      except FileNotFoundError:
+        return b""
+
+  def get_identity_snapshot(self) -> tuple[bytes, bytes]:
+    """Gets the current public key and attestation token together."""
+    with self._lock:
+      public_key = self.key_manager.get_current_public_key()
+      try:
+        with open(self.attestation_token_path, "rb") as f:
+          token = f.read()
+      except FileNotFoundError:
+        token = b""
+      return public_key, token
+
+  def _calculate_refresh_duration(self) -> float:
+    """Calculates how long to sleep until the 90% mark, minus jitter."""
+    token_bytes = self.get_attestation_token()
+
+    if not token_bytes:
+      logging.info("No token found. Refresh needed immediately.")
+      return 0.0
+
+    try:
+      claims = jwt.decode(
+          token_bytes.decode("utf-8"), options={"verify_signature": False}
+      )
+      exp = claims.get("exp")
+      iat = claims.get("iat")
+    except (
+        jwt.exceptions.DecodeError,
+        jwt.exceptions.InvalidTokenError,
+        jwt.exceptions.InvalidSignatureError,
+        jwt.exceptions.InvalidAlgorithmError,
+    ):
+      logging.exception(
+          "Failed to parse token from %r for timing. Refreshing immediately.",
+          self.attestation_token_path,
+      )
+      return 0.0
+
+    if not exp or not iat:
+      return 0.0
+
+    now = time.time()
+    lifespan = exp - iat
+    target_time = iat + (lifespan * DEFAULT_REFRESH_MULTIPLIER)
+
+    wait_seconds = target_time - now
+    jitter = self.rng.uniform(0, self.jitter_window_seconds)
+    return max(0.0, wait_seconds - jitter)
+
+  def _run(self):
+    """Checks if the token is expired based on iat and exp claims."""
+    while not self._stop_event.is_set():
+      try:
+        sleep_duration = self._calculate_refresh_duration()
+        if self._stop_event.wait(timeout=sleep_duration):
+          break
+        self.refresh()
+
+      except (OSError, RuntimeError, ValueError):
+        logging.exception("Refresher failed with unexpected error.")
+        time.sleep(DEFAULT_RETRY_INTERVAL_SECONDS)
+
+  def start(self):
+    logging.info("Starting token manager.")
+    self._thread.start()
+
+  def stop(self):
+    logging.info("Stopping token manager.")
+    self._stop_event.set()
+    self._thread.join()
+
+
+class AttestedTLS:
+  """Handles AttestConnection logic."""
+
+  def __init__(self, token_manager: TokenManager):
+    self.token_manager = token_manager
+
+  def __repr__(self):
+    return f"AttestedTLS(token_manager={self.token_manager!r})"
+
+  def attest_connection(
+      self,
+      request: attestation_pb2.AttestConnectionRequest,
+  ) -> attestation_pb2.AttestConnectionResponse:
+    """Processes the AttestConnectionRequest and returns an AttestConnectionResponse.
+
+    This function returns an attested TLS response containing an attestation
+    token with the hash of the server's public key embedded in it. It also signs
+    the TLS session material and hash of the attestation token with the private
+    key and includes the signature in the response.
+
+    Args:
+      request: The AttestConnectionRequest message.
+
+    Returns:
+      An AttestConnectionResponse message containing the attestation token and
+      the server's public key and signed TLS session material.
+
+    Raises:
+      ValueError: If no required_verifier_type is specified or if an unsupported
+        verifier type is requested.
+    """
+    if not request.required_verifier_type:
+      raise ValueError("At least one required_verifier_type must be specified.")
+
+    if (
+        attestation_pb2.VerifierType.VERIFIER_TYPE_GCA
+        not in request.required_verifier_type
+    ):
+      raise ValueError(
+          "Unsupported verifier types requested:"
+          f" {request.required_verifier_type}"
+      )
+
+    public_key, attestation_token = self.token_manager.get_identity_snapshot()
+    response = attestation_pb2.AttestConnectionResponse(
+        evidence=[
+            attestation_pb2.AttestationEvidence(
+                verifier_type=attestation_pb2.VerifierType.VERIFIER_TYPE_GCA,
+                gca_bundle=attestation_pb2.GcaTrustBundle(
+                    attestation_token=attestation_token.decode("utf-8")
+                ),
+            )
+        ],
+        instance_public_key=attestation_pb2.EcdsaP256PublicKey(
+            key_bytes=public_key
+        ),
+    )
+    # TODO: b/463825032 - Update it to include signed EKM.
+    return response
+
+
 def get_custom_token_bytes(
     socket_path: pathlib.Path = pathlib.Path(TEE_SERVER_SOCKET_PATH),
     connection_factory: Callable[
@@ -166,10 +364,18 @@ def calculate_fingerprint(public_key: bytes) -> str:
 
 
 def _write_file(path: pathlib.Path, data: bytes, mode: int) -> None:
-  """Helper to write files safely."""
-  fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
-  with os.fdopen(fd, "wb") as f:
-    f.write(data)
+  """Helper to write files atomically."""
+  path = pathlib.Path(path)
+  temp_path = path.with_name(path.name + ".tmp")
+  try:
+    fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "wb") as f:
+      f.write(data)
+    os.replace(temp_path, path)
+  except Exception as e:
+    if temp_path.exists():
+      os.remove(temp_path)
+    raise ValueError(f"Could not write file atomically: {path!r}") from e
 
 
 def _read_file(path: pathlib.Path) -> bytes:
