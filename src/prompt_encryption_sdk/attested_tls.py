@@ -260,11 +260,18 @@ class TokenManager:
         logging.exception("Refresher failed with unexpected error.")
         time.sleep(DEFAULT_RETRY_INTERVAL_SECONDS)
 
-  def start(self):
+  def __enter__(self) -> "TokenManager":
     logging.info("Starting token manager.")
     self._thread.start()
+    self._stop_event.clear()
+    return self
 
-  def stop(self):
+  def __exit__(
+      self,
+      exc_type: type[BaseException] | None,
+      exc_val: BaseException | None,
+      exc_tb: types.TracebackType | None,
+  ) -> None:
     logging.info("Stopping token manager.")
     self._stop_event.set()
     self._thread.join()
