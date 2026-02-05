@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping
 import hashlib
+import json
 import logging
 import types
 from typing import Any
@@ -9,11 +10,17 @@ from typing import Any
 from prompt_encryption_sdk.client import constants
 from prompt_encryption_sdk.client import exceptions
 from prompt_encryption_sdk.proto import attestation_pb2
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 import jwt
 import requests
+import tink
+from tink import jwt as tink_jwt
 
 
 logger = logging.getLogger(__name__)
+tink_jwt.register_jwt_signature()
 
 
 _GCA_STRING_BY_HW_MODEL = types.MappingProxyType({
@@ -21,6 +28,7 @@ _GCA_STRING_BY_HW_MODEL = types.MappingProxyType({
     attestation_pb2.HARDWARE_MODEL_SEV: "GCP_AMD_SEV",
     attestation_pb2.HARDWARE_MODEL_SEV_SNP: "GCP_AMD_SEV_SNP",
 })
+
 
 _GCE_POLICY_FIELDS = ("project_id", "zone", "instance_id", "instance_name")
 
@@ -69,19 +77,20 @@ class OIDCTokenValidator:
     try:
       # 1. Fetch the signing key that matches the 'kid' in the token header
       assert self._jwks_client is not None
-      signing_key = self._jwks_client.get_signing_key_from_jwt(token)
-
-      # 2. Verify signature, expiration, and issuer
-      return jwt.decode(
-          token,
-          signing_key.key,
-          algorithms=["RS256"],
-          issuer=self._issuer,
-          # We disable strict audience check for Phase 1 as the audience
-          # might be generic (e.g., "https://sts.google.com") or specific.
-          options={"verify_aud": False},
+      jwk_set_dict = self._jwks_client.fetch_data()
+      jwk_set_json_str = json.dumps(jwk_set_dict)
+      public_keyset_handle = tink_jwt.jwk_set_to_public_keyset_handle(
+          jwk_set_json_str
       )
-    except jwt.PyJWTError as e:
+      verifier = public_keyset_handle.primitive(tink_jwt.JwtPublicKeyVerify)
+      validator = tink_jwt.new_validator(
+          expected_issuer=self._issuer,
+          expected_audience=constants.DEFAULT_AUDIENCE,
+          expected_type_header="JWT",
+      )
+      result = verifier.verify_and_decode(token, validator)
+      return result._raw_jwt._payload
+    except (tink.TinkError, Exception) as e:
       raise exceptions.AttestationVerificationError(
           "OIDC Token validation failed."
       ) from e
@@ -94,10 +103,12 @@ class AttestationValidator:
       self,
       policy: attestation_pb2.AttestationPolicy,
       oidc_validator: OIDCTokenValidator | None = None,
+      pem_loader: Any = serialization.load_pem_public_key,
   ):
     self._policy = policy
     self._oidc_validator = oidc_validator or OIDCTokenValidator()
     self._owns_oidc_validator = oidc_validator is None
+    self._pem_loader = pem_loader
 
   def close(self) -> None:
     """Closes resources held by the validator."""
@@ -159,7 +170,24 @@ class AttestationValidator:
 
     self._verify_instance_key_binding(claims, instance_pub_bytes)
 
-    # TODO(ashpaw): Add TLS Session binding Verification once server is implemented.
+    # 5. Verify TLS Session Binding (Signature over EKM)
+    if not response.session_signature:
+      raise exceptions.AttestationVerificationError(
+          "session signature is missing."
+      )
+
+    # Reconstruct Payload: EKM || SHA256(Token)
+    token_hash = hashlib.sha256(
+        gca_bundle.attestation_token.encode("utf-8")
+    ).hexdigest()
+    token_hash_bytes = token_hash.encode("utf-8")
+    payload = tls_ekm + token_hash_bytes
+
+    self._verify_session_signature(
+        response.instance_public_key,
+        signature=response.session_signature,
+        payload=payload,
+    )
 
   def _enforce_policy(self, claims: Mapping[str, Any]) -> None:
     """Validates OIDC claims against the configured AttestationPolicy.
@@ -275,3 +303,37 @@ class AttestationValidator:
           f"Instance Key binding failed. Key fingerprint {expected_nonce_hex}"
           f" not found in token nonces {eat_nonce_list!r}."
       )
+
+  def _verify_session_signature(
+      self,
+      pub_key_proto: attestation_pb2.EcdsaP256PublicKey,
+      *,
+      signature: bytes,
+      payload: bytes,
+  ) -> None:
+    """Verifies that the signature is valid for the given payload.
+
+    Args:
+        pub_key_proto: The ECDSA P256 public key used for verification.
+        signature: The signature bytes to verify.
+        payload: The payload bytes that were signed.
+
+    Raises:
+        AttestationVerificationError: If the public key is invalid, not an
+          Elliptic Curve key, or the signature verification fails.
+    """
+    try:
+      public_key = self._pem_loader(pub_key_proto.key_bytes)
+
+      if not isinstance(public_key, ec.EllipticCurvePublicKey):
+        raise exceptions.AttestationVerificationError(
+            "instance key is not an Elliptic Curve key."
+        )
+
+      public_key.verify(signature, payload, ec.ECDSA(hashes.SHA256()))
+    except Exception as e:
+      if isinstance(e, exceptions.AttestationVerificationError):
+        raise
+      raise exceptions.AttestationVerificationError(
+          "session signature verification failed."
+      ) from e

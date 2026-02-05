@@ -1,6 +1,7 @@
 """Tests for the AttestationValidator and OIDCTokenValidator classes."""
 
 import hashlib
+import json
 from typing import Any
 from unittest import mock
 
@@ -12,6 +13,8 @@ from prompt_encryption_sdk.client import validator
 from prompt_encryption_sdk.proto import attestation_pb2
 import jwt
 import requests
+import tink
+from tink import jwt as tink_jwt
 
 
 # --- Deterministic Test Constants ---
@@ -27,6 +30,7 @@ _FAKE_ZONE = "us-central1-a"
 _FAKE_INSTANCE_NAME = "mhv-test-atls2"
 _FAKE_INSTANCE_ID = "2725765997796889912"
 _FAKE_PUB_KEY = b"fake-ecdsa-public-key-bytes"
+_FAKE_SESSION_SIGNATURE = b"fake-session-signature"
 
 
 def _get_valid_claims() -> dict[str, Any]:
@@ -59,7 +63,16 @@ class AttestationValidatorTest(parameterized.TestCase):
         mock.patch.object(requests.Session, "get", autospec=True)
     )
     self.policy = attestation_pb2.AttestationPolicy()
-    self.validator = validator.AttestationValidator(self.policy)
+    self.mock_pem_loader = mock.Mock(
+        spec=validator.serialization.load_pem_public_key
+    )
+    self.mock_ec_pub_key = mock.create_autospec(
+        validator.ec.EllipticCurvePublicKey, instance=True
+    )
+    self.mock_pem_loader.return_value = self.mock_ec_pub_key
+    self.validator = validator.AttestationValidator(
+        self.policy, pem_loader=self.mock_pem_loader
+    )
 
   # --- 1. Instance Key Binding Tests ---
 
@@ -194,16 +207,30 @@ class AttestationValidatorTest(parameterized.TestCase):
         )
     )
     mock_oidc.return_value = _get_valid_claims()
-
-    response = attestation_pb2.AttestConnectionResponse()
-    response.instance_public_key.key_bytes = _FAKE_PUB_KEY
-    evidence = response.evidence.add(
-        verifier_type=attestation_pb2.VerifierType.VERIFIER_TYPE_GCA,
+    mock_verify_session_signature = self.enter_context(
+        mock.patch.object(
+            self.validator, "_verify_session_signature", autospec=True
+        )
     )
-    evidence.gca_bundle.attestation_token = "valid.jwt.payload"
+
+    response = attestation_pb2.AttestConnectionResponse(
+        instance_public_key=attestation_pb2.EcdsaP256PublicKey(
+            key_bytes=_FAKE_PUB_KEY
+        ),
+        session_signature=_FAKE_SESSION_SIGNATURE,
+        evidence=[
+            attestation_pb2.AttestationEvidence(
+                verifier_type=attestation_pb2.VerifierType.VERIFIER_TYPE_GCA,
+                gca_bundle=attestation_pb2.GcaTrustBundle(
+                    attestation_token="valid.jwt.payload"
+                ),
+            ),
+        ],
+    )
 
     self.validator.validate(response, tls_ekm=b"fake_ekm_material")
     mock_oidc.assert_called_once_with(mock.ANY, "valid.jwt.payload")
+    mock_verify_session_signature.assert_called_once()
 
   def test_validate_no_evidence_fails(self):
     """Tests failure when no attestation evidence is provided."""
@@ -246,15 +273,47 @@ class AttestationValidatorTest(parameterized.TestCase):
         return_value=_get_valid_claims(),
         autospec=True,
     ):
-      response = attestation_pb2.AttestConnectionResponse()
-      evidence = response.evidence.add(
-          verifier_type=attestation_pb2.VerifierType.VERIFIER_TYPE_GCA,
+      response = attestation_pb2.AttestConnectionResponse(
+          evidence=[
+              attestation_pb2.AttestationEvidence(
+                  verifier_type=attestation_pb2.VerifierType.VERIFIER_TYPE_GCA,
+                  gca_bundle=attestation_pb2.GcaTrustBundle(
+                      attestation_token="valid.jwt.payload"
+                  ),
+              ),
+          ],
+          # instance_public_key is missing
       )
-      evidence.gca_bundle.attestation_token = "valid.jwt.payload"
-      # instance_public_key is missing
       with self.assertRaisesRegex(
           exceptions.AttestationVerificationError,
           "Instance public key is missing",
+      ):
+        self.validator.validate(response, tls_ekm=b"")
+
+  def test_validate_missing_session_signature_fails(self):
+    with mock.patch.object(
+        self.validator._oidc_validator,
+        "validate_token",
+        return_value=_get_valid_claims(),
+        autospec=True,
+    ):
+      response = attestation_pb2.AttestConnectionResponse(
+          instance_public_key=attestation_pb2.EcdsaP256PublicKey(
+              key_bytes=_FAKE_PUB_KEY
+          ),
+          evidence=[
+              attestation_pb2.AttestationEvidence(
+                  verifier_type=attestation_pb2.VerifierType.VERIFIER_TYPE_GCA,
+                  gca_bundle=attestation_pb2.GcaTrustBundle(
+                      attestation_token="valid.jwt.payload"
+                  ),
+              ),
+          ],
+          # session_signature is missing
+      )
+      with self.assertRaisesRegex(
+          exceptions.AttestationVerificationError,
+          "session signature is missing",
       ):
         self.validator.validate(response, tls_ekm=b"")
 
@@ -263,15 +322,28 @@ class AttestationValidatorTest(parameterized.TestCase):
     mock_oidc_validator = mock.create_autospec(validator.OIDCTokenValidator)
     mock_oidc_validator.validate_token.return_value = _get_valid_claims()
     av = validator.AttestationValidator(
-        self.policy, oidc_validator=mock_oidc_validator
+        self.policy,
+        oidc_validator=mock_oidc_validator,
+        pem_loader=self.mock_pem_loader,
+    )
+    self.enter_context(
+        mock.patch.object(av, "_verify_session_signature", autospec=True)
     )
 
-    response = attestation_pb2.AttestConnectionResponse()
-    response.instance_public_key.key_bytes = _FAKE_PUB_KEY
-    evidence = response.evidence.add(
-        verifier_type=attestation_pb2.VerifierType.VERIFIER_TYPE_GCA,
+    response = attestation_pb2.AttestConnectionResponse(
+        instance_public_key=attestation_pb2.EcdsaP256PublicKey(
+            key_bytes=_FAKE_PUB_KEY
+        ),
+        session_signature=_FAKE_SESSION_SIGNATURE,
+        evidence=[
+            attestation_pb2.AttestationEvidence(
+                verifier_type=attestation_pb2.VerifierType.VERIFIER_TYPE_GCA,
+                gca_bundle=attestation_pb2.GcaTrustBundle(
+                    attestation_token="valid.jwt.payload"
+                ),
+            ),
+        ],
     )
-    evidence.gca_bundle.attestation_token = "valid.jwt.payload"
 
     av.validate(response, tls_ekm=b"fake_ekm_material")
     mock_oidc_validator.validate_token.assert_called_once_with(
@@ -318,20 +390,89 @@ class AttestationValidatorTest(parameterized.TestCase):
           "_verify_instance_key_binding",
           wraps=self.validator._verify_instance_key_binding,
       ) as spy_binding:
+        with mock.patch.object(
+            self.validator,
+            "_verify_session_signature",
+            wraps=self.validator._verify_session_signature,
+        ) as spy_sig:
+          response = attestation_pb2.AttestConnectionResponse(
+              instance_public_key=attestation_pb2.EcdsaP256PublicKey(
+                  key_bytes=_FAKE_PUB_KEY
+              ),
+              session_signature=_FAKE_SESSION_SIGNATURE,
+              evidence=[
+                  attestation_pb2.AttestationEvidence(
+                      verifier_type=(
+                          attestation_pb2.VerifierType.VERIFIER_TYPE_GCA
+                      ),
+                      gca_bundle=attestation_pb2.GcaTrustBundle(
+                          attestation_token="valid.jwt.payload"
+                      ),
+                  ),
+              ],
+          )
 
-        response = attestation_pb2.AttestConnectionResponse()
-        response.instance_public_key.key_bytes = _FAKE_PUB_KEY
-        evidence = response.evidence.add(
-            verifier_type=attestation_pb2.VerifierType.VERIFIER_TYPE_GCA,
-        )
-        evidence.gca_bundle.attestation_token = "valid.jwt.payload"
+          self.validator.validate(response, tls_ekm=b"fake_ekm_material")
 
-        self.validator.validate(response, tls_ekm=b"fake_ekm_material")
+          with self.subTest(name="enforce_policy_called"):
+            spy_policy.assert_called_once_with(claims)
+          with self.subTest(name="verify_instance_key_binding_called"):
+            spy_binding.assert_called_once_with(claims, _FAKE_PUB_KEY)
+          with self.subTest(name="verify_session_signature_called"):
+            spy_sig.assert_called_once()
 
-        # If Line 142 is removed, this fails:
-        spy_policy.assert_called_once_with(claims)
-        # If Line 150 is removed, this fails:
-        spy_binding.assert_called_once_with(claims, _FAKE_PUB_KEY)
+  # --- 5. Session Signature Verification Tests ---
+  def test_verify_session_signature_success(self):
+    """Tests successful session signature verification."""
+    mock_pub_key = mock.MagicMock(spec=validator.ec.EllipticCurvePublicKey)
+    self.mock_pem_loader.return_value = mock_pub_key
+    pub_key_proto = attestation_pb2.EcdsaP256PublicKey(key_bytes=_FAKE_PUB_KEY)
+    payload = b"payload"
+
+    self.validator._verify_session_signature(
+        pub_key_proto, signature=_FAKE_SESSION_SIGNATURE, payload=payload
+    )
+    self.mock_pem_loader.assert_called_once_with(_FAKE_PUB_KEY)
+    mock_pub_key.verify.assert_called_once_with(
+        _FAKE_SESSION_SIGNATURE, payload, mock.ANY
+    )
+
+  def test_verify_session_signature_fails_on_bad_key_type(self):
+    """Tests session signature verification fails with a bad public key type."""
+    mock_pub_key = mock.Mock()  # Not an EC key
+    self.mock_pem_loader.return_value = mock_pub_key
+    pub_key_proto = attestation_pb2.EcdsaP256PublicKey(key_bytes=_FAKE_PUB_KEY)
+    payload = b"payload"
+
+    with self.assertRaisesRegex(
+        exceptions.AttestationVerificationError,
+        "instance key is not an Elliptic Curve key.",
+    ):
+      self.validator._verify_session_signature(
+          pub_key_proto, signature=_FAKE_SESSION_SIGNATURE, payload=payload
+      )
+    self.mock_pem_loader.assert_called_once_with(_FAKE_PUB_KEY)
+    mock_pub_key.verify.assert_not_called()
+
+  def test_verify_session_signature_fails_on_bad_signature(self):
+    """Tests session signature verification fails on an invalid signature."""
+    mock_pub_key = mock.MagicMock(spec=validator.ec.EllipticCurvePublicKey)
+    mock_pub_key.verify.side_effect = Exception("Invalid signature")
+    self.mock_pem_loader.return_value = mock_pub_key
+    pub_key_proto = attestation_pb2.EcdsaP256PublicKey(key_bytes=_FAKE_PUB_KEY)
+    payload = b"payload"
+
+    with self.assertRaisesRegex(
+        exceptions.AttestationVerificationError,
+        "session signature verification failed.",
+    ):
+      self.validator._verify_session_signature(
+          pub_key_proto, signature=_FAKE_SESSION_SIGNATURE, payload=payload
+      )
+    self.mock_pem_loader.assert_called_once_with(_FAKE_PUB_KEY)
+    mock_pub_key.verify.assert_called_once_with(
+        _FAKE_SESSION_SIGNATURE, payload, mock.ANY
+    )
 
 
 class OIDCTokenValidatorTest(parameterized.TestCase):
@@ -343,35 +484,58 @@ class OIDCTokenValidatorTest(parameterized.TestCase):
     )
 
   def test_validate_token_success_and_options(self):
-    """Tests that validate_token succeeds and passes correct options to jwt.decode."""
+    """Tests that validate_token succeeds with tink-jwt."""
     self.mock_get.return_value.status_code = 200
     self.mock_get.return_value.json.return_value = {
-        "issuer": constants.CS_DEFAULT_ISSUER,
-        "jwks_uri": constants.CS_DEFAULT_JWKS_URI,
+        "issuer": "http://test-issuer",
+        "jwks_uri": "http://test-jwks-uri",
     }
-    mock_key = mock.Mock()
     mock_jwk_client = self.enter_context(
         mock.patch.object(jwt, "PyJWKClient", autospec=True)
     )
-    mock_jwk_client.return_value.get_signing_key_from_jwt.return_value = (
-        mock_key
+    jwk_set_dict = {"keys": [{"kid": "123"}]}
+    mock_jwk_client.return_value.fetch_data.return_value = jwk_set_dict
+
+    mock_verifier = mock.Mock()
+    mock_keyset_handle = mock.Mock()
+    mock_keyset_handle.primitive.return_value = mock_verifier
+
+    mock_jwk_set_to_public_keyset_handle = self.enter_context(
+        mock.patch.object(
+            tink_jwt, "jwk_set_to_public_keyset_handle", autospec=True
+        )
     )
-    mock_decode = self.enter_context(
-        mock.patch.object(jwt, "decode", autospec=True)
+    mock_jwk_set_to_public_keyset_handle.return_value = mock_keyset_handle
+
+    mock_tink_validator = mock.Mock()
+    mock_new_validator = self.enter_context(
+        mock.patch.object(
+            tink_jwt, "new_validator", return_value=mock_tink_validator
+        )
     )
-    mock_decode.return_value = {"claim": "value"}
+
+    mock_verified_jwt = mock.Mock()
+    mock_verified_jwt._raw_jwt._payload = {"claim": "value"}
+    mock_verifier.verify_and_decode.return_value = mock_verified_jwt
 
     v = validator.OIDCTokenValidator()
     token = "some.valid.token"
     result = v.validate_token(token)
 
     self.assertEqual(result, {"claim": "value"})
-    mock_decode.assert_called_once_with(
-        token,
-        mock_key.key,
-        algorithms=["RS256"],
-        issuer=constants.CS_DEFAULT_ISSUER,
-        options={"verify_aud": False},
+    mock_jwk_set_to_public_keyset_handle.assert_called_once_with(
+        json.dumps(jwk_set_dict)
+    )
+    mock_keyset_handle.primitive.assert_called_once_with(
+        tink_jwt.JwtPublicKeyVerify
+    )
+    mock_new_validator.assert_called_once_with(
+        expected_issuer="http://test-issuer",
+        expected_audience=constants.DEFAULT_AUDIENCE,
+        expected_type_header="JWT",
+    )
+    mock_verifier.verify_and_decode.assert_called_once_with(
+        token, mock_tink_validator
     )
 
   def test_oidc_discovery_fallback_on_network_error(self):
@@ -383,22 +547,24 @@ class OIDCTokenValidatorTest(parameterized.TestCase):
 
   def test_validate_token_failure(self):
     """Tests that JWT decode errors are correctly caught and wrapped."""
-    self.enter_context(
+    mock_jwk_client = self.enter_context(
+        mock.patch.object(jwt, "PyJWKClient", autospec=True)
+    )
+    mock_jwk_client.return_value.fetch_data.return_value = {"keys": []}
+
+    mock_jwk_set_to_public_keyset_handle = self.enter_context(
         mock.patch.object(
-            jwt.PyJWKClient, "get_signing_key_from_jwt", autospec=True
+            tink_jwt, "jwk_set_to_public_keyset_handle", autospec=True
         )
     )
-    self.enter_context(
-        mock.patch.object(
-            jwt,
-            "decode",
-            side_effect=jwt.InvalidTokenError("Bad Signature"),
-            autospec=True,
-        )
-    )
+    mock_verifier = mock.Mock()
+    mock_keyset_handle = mock.Mock()
+    mock_keyset_handle.primitive.return_value = mock_verifier
+    mock_jwk_set_to_public_keyset_handle.return_value = mock_keyset_handle
+
+    mock_verifier.verify_and_decode.side_effect = tink.TinkError("Bad Signature")
 
     v = validator.OIDCTokenValidator()
-    v._jwks_client = mock.Mock()
 
     with self.assertRaisesRegex(
         exceptions.AttestationVerificationError, "OIDC Token validation failed"

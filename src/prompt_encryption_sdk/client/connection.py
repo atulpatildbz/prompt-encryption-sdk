@@ -8,7 +8,7 @@ attestation handshakes and session revalidation.
 import datetime
 import json
 import logging
-import os
+import secrets
 import socket
 import ssl
 import time
@@ -118,23 +118,24 @@ class AttestedHTTPSConnection(connection.HTTPSConnection):
     """Executes the attestation protocol (Request -> Response -> Validate)."""
 
     # A. Generate a fresh nonce
-    nonce = os.urandom(constants.NONCE_LENGTH)
+    nonce = secrets.token_bytes(constants.NONCE_LENGTH)
 
     attestation_req = attestation_pb2.AttestConnectionRequest(
         required_verifier_type=[attestation_pb2.VerifierType.VERIFIER_TYPE_GCA],
         nonce=nonce,
     )
+    json_body = json_format.MessageToJson(attestation_req)
     # B. Send Request
     try:
-      # Note: We call the superclass's `request` method explicitly here to avoid a recursive
-      # loop during the handshake.
+      # Note: We call the superclass's `request` method explicitly here to
+      # avoid a recursive loop during the handshake.
       # Using HTTPConnection request method to send raw bytes.
       super().request(
           "POST",
           constants.ATTESTATION_ENDPOINT,
-          body=attestation_req.SerializeToString(),
+          body=json_body,
           headers={
-              "Content-Type": "application/x-protobuf",
+              "Content-Type": "application/json",
               "Accept": "application/json, application/x-protobuf",
           },
       )

@@ -189,7 +189,7 @@ class AttestedHTTPSConnectionTest(parameterized.TestCase):
           json.dumps({"evidence": []}).encode(),
       ),
   )
-  @mock.patch.object(connection, "os", autospec=True)
+  @mock.patch.object(connection.secrets, "token_bytes", autospec=True)
   @mock.patch.object(HTTPSConnection, "request", autospec=True)
   @mock.patch.object(ekm_exporter, "export_keying_material", autospec=True)
   @mock.patch.object(validator, "AttestationValidator", autospec=True)
@@ -200,7 +200,7 @@ class AttestedHTTPSConnectionTest(parameterized.TestCase):
       mock_validator_cls,
       mock_export_ekm,
       mock_super_request,
-      mock_os,
+      mock_token_bytes,
   ):
     """Tests the full handshake: Request -> Response -> EKM -> Validate."""
     # 1. Mock HTTP Response
@@ -211,9 +211,9 @@ class AttestedHTTPSConnectionTest(parameterized.TestCase):
     self.conn.getresponse = mock.MagicMock(return_value=mock_response)
     mock_response.__enter__.return_value = mock_response
 
-    # Mock os.urandom to ensure deterministic context
+    # Mock secrets.token_bytes to ensure deterministic context
     fixed_random_bytes = b"deterministic_random_context"
-    mock_os.urandom.return_value = fixed_random_bytes
+    mock_token_bytes.return_value = fixed_random_bytes
 
     # 2. Mock EKM and Validator
     self.conn._ekm_exporter_fn = mock_export_ekm
@@ -232,7 +232,7 @@ class AttestedHTTPSConnectionTest(parameterized.TestCase):
         "POST",
         constants.ATTESTATION_ENDPOINT,
         headers={
-            "Content-Type": "application/x-protobuf",
+            "Content-Type": "application/json",
             "Accept": "application/json, application/x-protobuf",
         },
         body=mock.ANY,
