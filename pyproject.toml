@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "google-cloud-confidential-inference"
+version = "0.1.0"
+description = "A library for Confidential Inference that establishes an end-to-end, attested TLS channel to a workload in a Trusted Execution Environment (TEE)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "absl-py",
+    "cryptography",
+    "protobuf",
+    "PyJWT",
+    "requests",
+    "tink",
+    "urllib3",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["attested_confidential_inference*"]
