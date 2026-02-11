@@ -1,6 +1,7 @@
 """Tests for middleware."""
 
 import asyncio
+import json
 from unittest import mock
 
 from absl.testing import absltest
@@ -8,6 +9,7 @@ from attested_confidential_inference import attested_tls as at
 from attested_confidential_inference import middleware
 from attested_confidential_inference.proto import attestation_pb2
 from google.protobuf import json_format
+from uvicorn.protocols.http import h11_impl
 
 
 class MiddlewareTest(absltest.TestCase):
@@ -20,6 +22,7 @@ class MiddlewareTest(absltest.TestCase):
         self.app, self.mock_attested_tls
     )
     self.send = mock.AsyncMock()
+    self.ssl_obj = mock.MagicMock()
 
   def test_call_other_path(self):
     async def run():
@@ -37,8 +40,13 @@ class MiddlewareTest(absltest.TestCase):
           "path": "/_attest-connection",
           "method": "POST",
           "headers": [],
+          "extensions": {"tls_socket": self.ssl_obj},
       }
-      request_proto = attestation_pb2.AttestConnectionRequest()
+      request_proto = attestation_pb2.AttestConnectionRequest(
+          required_verifier_type=[
+              attestation_pb2.VerifierType.VERIFIER_TYPE_GCA
+          ]
+      )
       body = json_format.MessageToJson(request_proto).encode("utf-8")
 
       async def receive():
@@ -53,25 +61,112 @@ class MiddlewareTest(absltest.TestCase):
 
       await self.mw(scope, receive, self.send)
 
-      self.mock_attested_tls.attest_connection.assert_called_once()
+      self.mock_attested_tls.attest_connection.assert_called_once_with(
+          request_proto, self.ssl_obj, "EXPORTER-Confidential-Inference"
+      )
       calls = self.send.call_args_list
       self.assertEqual(calls[0].args[0]["type"], "http.response.start")
       self.assertEqual(calls[0].args[0]["status"], 200)
       self.assertEqual(calls[1].args[0]["type"], "http.response.body")
+      response_dict = json_format.MessageToDict(response_proto)
       self.assertEqual(
           calls[1].args[0]["body"],
-          json_format.MessageToJson(response_proto).encode("utf-8"),
+          json.dumps(response_dict).encode("utf-8"),
       )
 
     asyncio.run(run())
 
-  def test_attest_connection_parse_error(self):
+  def test_handle_attestation_success_with_label(self):
     async def run():
       scope = {
           "type": "http",
           "path": "/_attest-connection",
           "method": "POST",
           "headers": [],
+          "extensions": {"tls_socket": self.ssl_obj},
+      }
+      request_dict = {
+          "requiredVerifierType": ["VERIFIER_TYPE_GCA"],
+          "label": "my-custom-label",
+      }
+      body = json.dumps(request_dict).encode("utf-8")
+
+      request_proto = attestation_pb2.AttestConnectionRequest(
+          required_verifier_type=[
+              attestation_pb2.VerifierType.VERIFIER_TYPE_GCA
+          ]
+      )
+
+      async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+      response_proto = attestation_pb2.AttestConnectionResponse(
+          instance_public_key=attestation_pb2.EcdsaP256PublicKey(
+              key_bytes=b"test_public_key"
+          )
+      )
+      self.mock_attested_tls.attest_connection.return_value = response_proto
+
+      await self.mw(scope, receive, self.send)
+
+      self.mock_attested_tls.attest_connection.assert_called_once_with(
+          request_proto, self.ssl_obj, "my-custom-label"
+      )
+      calls = self.send.call_args_list
+      self.assertEqual(calls[0].args[0]["type"], "http.response.start")
+      self.assertEqual(calls[0].args[0]["status"], 200)
+      self.assertEqual(calls[1].args[0]["type"], "http.response.body")
+      response_dict = json_format.MessageToDict(response_proto)
+      self.assertEqual(
+          calls[1].args[0]["body"],
+          json.dumps(response_dict).encode("utf-8"),
+      )
+
+    asyncio.run(run())
+
+  def test_handle_attestation_no_ssl_obj(self):
+    async def run():
+      scope = {
+          "type": "http",
+          "path": "/_attest-connection",
+          "method": "POST",
+          "headers": [],
+          "extensions": {},
+      }
+      request_proto = attestation_pb2.AttestConnectionRequest()
+      body = json_format.MessageToJson(request_proto).encode("utf-8")
+
+      async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+      await self.mw(scope, receive, self.send)
+
+      self.mock_attested_tls.attest_connection.assert_not_called()
+      calls = self.send.call_args_list
+      self.assertEqual(calls[0].args[0]["type"], "http.response.start")
+      self.assertEqual(calls[0].args[0]["status"], 500)
+      self.assertEqual(calls[1].args[0]["type"], "http.response.body")
+      body_dict = json.loads(calls[1].args[0]["body"])
+      self.assertEqual(
+          body_dict,
+          {
+              "error": (
+                  "An internal server error occurred: RuntimeError('TLS Socket"
+                  " not found.')"
+              )
+          },
+      )
+
+    asyncio.run(run())
+
+  def test_handle_attestation_invalid_json_body(self):
+    async def run():
+      scope = {
+          "type": "http",
+          "path": "/_attest-connection",
+          "method": "POST",
+          "headers": [],
+          "extensions": {"tls_socket": self.ssl_obj},
       }
       body = b"invalid json"
 
@@ -83,9 +178,62 @@ class MiddlewareTest(absltest.TestCase):
       self.mock_attested_tls.attest_connection.assert_not_called()
       calls = self.send.call_args_list
       self.assertEqual(calls[0].args[0]["type"], "http.response.start")
-      self.assertEqual(calls[0].args[0]["status"], 400)
+      self.assertEqual(calls[0].args[0]["status"], 500)
       self.assertEqual(calls[1].args[0]["type"], "http.response.body")
-      self.assertEqual(calls[1].args[0]["body"], b'{"error":"Invalid request"}')
+      body_dict = json.loads(calls[1].args[0]["body"])
+      self.assertIn("An internal server error occurred", body_dict["error"])
+
+    asyncio.run(run())
+
+  def test_handle_attestation_undecodable_body(self):
+    async def run():
+      scope = {
+          "type": "http",
+          "path": "/_attest-connection",
+          "method": "POST",
+          "headers": [],
+          "extensions": {"tls_socket": self.ssl_obj},
+      }
+      body = b"\x80abc"
+
+      async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+      await self.mw(scope, receive, self.send)
+
+      self.mock_attested_tls.attest_connection.assert_not_called()
+      calls = self.send.call_args_list
+      self.assertEqual(calls[0].args[0]["type"], "http.response.start")
+      self.assertEqual(calls[0].args[0]["status"], 500)
+      self.assertEqual(calls[1].args[0]["type"], "http.response.body")
+      body_dict = json.loads(calls[1].args[0]["body"])
+      self.assertIn("An internal server error occurred", body_dict["error"])
+
+    asyncio.run(run())
+
+  def test_handle_attestation_proto_parse_error(self):
+    async def run():
+      scope = {
+          "type": "http",
+          "path": "/_attest-connection",
+          "method": "POST",
+          "headers": [],
+          "extensions": {"tls_socket": self.ssl_obj},
+      }
+      body = b'{"requiredVerifierType": 1}'
+
+      async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+      await self.mw(scope, receive, self.send)
+
+      self.mock_attested_tls.attest_connection.assert_not_called()
+      calls = self.send.call_args_list
+      self.assertEqual(calls[0].args[0]["type"], "http.response.start")
+      self.assertEqual(calls[0].args[0]["status"], 500)
+      self.assertEqual(calls[1].args[0]["type"], "http.response.body")
+      body_dict = json.loads(calls[1].args[0]["body"])
+      self.assertIn("An internal server error occurred", body_dict["error"])
 
     asyncio.run(run())
 
@@ -96,6 +244,7 @@ class MiddlewareTest(absltest.TestCase):
           "path": "/_attest-connection",
           "method": "POST",
           "headers": [],
+          "extensions": {"tls_socket": self.ssl_obj},
       }
       request_proto = attestation_pb2.AttestConnectionRequest()
       body = json_format.MessageToJson(request_proto).encode("utf-8")
@@ -114,10 +263,14 @@ class MiddlewareTest(absltest.TestCase):
       self.assertEqual(calls[0].args[0]["type"], "http.response.start")
       self.assertEqual(calls[0].args[0]["status"], 500)
       self.assertEqual(calls[1].args[0]["type"], "http.response.body")
+      body_dict = json.loads(calls[1].args[0]["body"])
       self.assertEqual(
-          calls[1].args[0]["body"],
-          b'{"error":"An internal server error occurred: ValueError(\'test'
-          b" error')\"}",
+          body_dict,
+          {
+              "error": (
+                  "An internal server error occurred: ValueError('test error')"
+              )
+          },
       )
 
     asyncio.run(run())
@@ -149,7 +302,13 @@ class MiddlewareTest(absltest.TestCase):
         mock_uvicorn_run.call_args[0][0], middleware.ConfidentialASGIMiddleware
     )
     self.assertEqual(
-        mock_uvicorn_run.call_args[1], {"host": "localhost", "port": 8000}
+        mock_uvicorn_run.call_args[1],
+        {
+            "host": "localhost",
+            "port": 8000,
+            "http": middleware.TlsInjectorProtocol,
+            "log_level": "info",
+        },
     )
     mock_token_manager_cls.return_value.__exit__.assert_called_once()
 
@@ -178,6 +337,192 @@ class MiddlewareTest(absltest.TestCase):
         mock_uvicorn_run.call_args[0][0], middleware.ConfidentialASGIMiddleware
     )
     self.assertEqual(
-        mock_uvicorn_run.call_args[1], {"host": "localhost", "port": 8000}
+        mock_uvicorn_run.call_args[1],
+        {
+            "host": "localhost",
+            "port": 8000,
+            "http": middleware.TlsInjectorProtocol,
+            "log_level": "info",
+        },
     )
     mock_token_manager.__exit__.assert_called_once()
+
+  @mock.patch.object(middleware.uvicorn, "run", autospec=True)
+  @mock.patch.object(at, "KeyManager", autospec=True)
+  @mock.patch.object(at, "TokenManager", autospec=True)
+  @mock.patch.object(at, "AttestedTLS", autospec=True)
+  def test_run_uvicorn_app_with_log_config(
+      self,
+      mock_attested_tls_cls,
+      mock_token_manager_cls,
+      mock_key_manager_cls,
+      mock_uvicorn_run,
+  ):
+    mock_app = mock.MagicMock()
+    middleware.run_uvicorn_app(
+        mock_app, host="localhost", port=8000, log_config={}
+    )
+
+    mock_key_manager_cls.assert_called_once()
+    mock_token_manager_cls.assert_called_once_with(
+        key_manager=mock_key_manager_cls.return_value
+    )
+    mock_token_manager_cls.return_value.__enter__.assert_called_once()
+    mock_attested_tls_cls.assert_called_once_with(
+        mock_token_manager_cls.return_value
+    )
+    mock_uvicorn_run.assert_called_once()
+    self.assertIsInstance(
+        mock_uvicorn_run.call_args[0][0], middleware.ConfidentialASGIMiddleware
+    )
+    self.assertEqual(
+        mock_uvicorn_run.call_args[1],
+        {
+            "host": "localhost",
+            "port": 8000,
+            "http": middleware.TlsInjectorProtocol,
+            "log_config": {},
+        },
+    )
+    mock_token_manager_cls.return_value.__exit__.assert_called_once()
+
+
+class TlsInjectorProtocolTest(absltest.TestCase):
+
+  def test_tls_injector_protocol_injects_ssl_object(self):
+    async def run():
+      original_app = mock.AsyncMock()
+      config = mock.MagicMock(spec=middleware.Config)
+      config.loaded_app = original_app
+      server_state = mock.MagicMock()
+      app_state = {}
+
+      with mock.patch.object(h11_impl, "h11_installed", True):
+        protocol = middleware.TlsInjectorProtocol(
+            config, server_state, app_state, _loop=asyncio.get_event_loop()
+        )
+      protocol.transport = mock.MagicMock()
+      ssl_object = mock.MagicMock()
+      protocol.transport.get_extra_info.return_value = ssl_object
+
+      scope = {"type": "http"}
+      receive = mock.AsyncMock()
+      send = mock.AsyncMock()
+
+      await protocol.app(scope, receive, send)
+
+      self.assertEqual(scope["extensions"]["tls_socket"], ssl_object)
+      original_app.assert_called_once_with(scope, receive, send)
+      protocol.transport.get_extra_info.assert_called_once_with("ssl_object")
+
+    asyncio.run(run())
+
+  def test_tls_injector_protocol_no_transport(self):
+    async def run():
+      original_app = mock.AsyncMock()
+      config = mock.MagicMock(spec=middleware.Config)
+      config.loaded_app = original_app
+      server_state = mock.MagicMock()
+      app_state = {}
+
+      with mock.patch.object(h11_impl, "h11_installed", True):
+        protocol = middleware.TlsInjectorProtocol(
+            config, server_state, app_state, _loop=asyncio.get_event_loop()
+        )
+      protocol.transport = None
+
+      scope = {"type": "http"}
+      receive = mock.AsyncMock()
+      send = mock.AsyncMock()
+
+      await protocol.app(scope, receive, send)
+
+      self.assertNotIn("extensions", scope)
+      original_app.assert_called_once_with(scope, receive, send)
+
+    asyncio.run(run())
+
+  def test_tls_injector_protocol_no_ssl_object(self):
+    async def run():
+      original_app = mock.AsyncMock()
+      config = mock.MagicMock(spec=middleware.Config)
+      config.loaded_app = original_app
+      server_state = mock.MagicMock()
+      app_state = {}
+
+      with mock.patch.object(h11_impl, "h11_installed", True):
+        protocol = middleware.TlsInjectorProtocol(
+            config, server_state, app_state, _loop=asyncio.get_event_loop()
+        )
+      protocol.transport = mock.MagicMock()
+      protocol.transport.get_extra_info.return_value = None
+
+      scope = {"type": "http"}
+      receive = mock.AsyncMock()
+      send = mock.AsyncMock()
+
+      await protocol.app(scope, receive, send)
+
+      self.assertNotIn("extensions", scope)
+      original_app.assert_called_once_with(scope, receive, send)
+      protocol.transport.get_extra_info.assert_called_once_with("ssl_object")
+
+    asyncio.run(run())
+
+  def test_tls_injector_protocol_not_http(self):
+    async def run():
+      original_app = mock.AsyncMock()
+      config = mock.MagicMock(spec=middleware.Config)
+      config.loaded_app = original_app
+      server_state = mock.MagicMock()
+      app_state = {}
+
+      with mock.patch.object(h11_impl, "h11_installed", True):
+        protocol = middleware.TlsInjectorProtocol(
+            config, server_state, app_state, _loop=asyncio.get_event_loop()
+        )
+      protocol.transport = mock.MagicMock()
+      protocol.transport.get_extra_info.return_value = mock.MagicMock()
+
+      scope = {"type": "not-http"}
+      receive = mock.AsyncMock()
+      send = mock.AsyncMock()
+
+      await protocol.app(scope, receive, send)
+
+      self.assertNotIn("extensions", scope)
+      original_app.assert_called_once_with(scope, receive, send)
+      protocol.transport.get_extra_info.assert_not_called()
+
+    asyncio.run(run())
+
+  def test_tls_injector_protocol_injects_ssl_object_with_existing_extensions(
+      self,
+  ):
+    async def run():
+      original_app = mock.AsyncMock()
+      config = mock.MagicMock(spec=middleware.Config)
+      config.loaded_app = original_app
+      server_state = mock.MagicMock()
+      app_state = {}
+
+      with mock.patch.object(h11_impl, "h11_installed", True):
+        protocol = middleware.TlsInjectorProtocol(
+            config, server_state, app_state, _loop=asyncio.get_event_loop()
+        )
+      protocol.transport = mock.MagicMock()
+      ssl_object = mock.MagicMock()
+      protocol.transport.get_extra_info.return_value = ssl_object
+
+      scope = {"type": "http", "extensions": {"other": 1}}
+      receive = mock.AsyncMock()
+      send = mock.AsyncMock()
+
+      await protocol.app(scope, receive, send)
+
+      self.assertEqual(scope["extensions"]["tls_socket"], ssl_object)
+      self.assertEqual(scope["extensions"]["other"], 1)
+      original_app.assert_called_once_with(scope, receive, send)
+      protocol.transport.get_extra_info.assert_called_once_with("ssl_object")
+
+    asyncio.run(run())

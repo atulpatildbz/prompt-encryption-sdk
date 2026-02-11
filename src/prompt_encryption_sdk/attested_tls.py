@@ -28,7 +28,9 @@ import time
 from typing import Any, Protocol
 
 from absl import logging
+from attested_confidential_inference.ekm import exporter
 from attested_confidential_inference.proto import attestation_pb2
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 import jwt
@@ -149,6 +151,21 @@ class KeyManager:
         self.public_key_path,
     )
     return pem_public
+
+  def sign_payload(self, payload: bytes) -> bytes:
+    """Signs a payload using the private key.
+
+    Args:
+      payload: The bytes of the payload to be signed.
+
+    Returns:
+      The ECDSA signature of the payload.
+    """
+    private_key_bytes = self._read_file_fn(self.private_key_path)
+    private_key = serialization.load_pem_private_key(
+        private_key_bytes, password=None
+    )
+    return private_key.sign(payload, ec.ECDSA(hashes.SHA256()))
 
   def get_current_public_key(self) -> bytes:
     """Reads and returns the public key bytes."""
@@ -303,6 +320,9 @@ class AttestedTLS:
   def attest_connection(
       self,
       request: attestation_pb2.AttestConnectionRequest,
+      *,
+      ssl_obj: Any,
+      label: str,
   ) -> attestation_pb2.AttestConnectionResponse:
     """Processes the AttestConnectionRequest and returns an AttestConnectionResponse.
 
@@ -313,6 +333,8 @@ class AttestedTLS:
 
     Args:
       request: The AttestConnectionRequest message.
+      ssl_obj: The SSL object from the TLS connection.
+      label: The label to use for EKM extraction.
 
     Returns:
       An AttestConnectionResponse message containing the attestation token and
@@ -321,9 +343,53 @@ class AttestedTLS:
     Raises:
       ValueError: If no required_verifier_type is specified or if an unsupported
         verifier type is requested.
+      RuntimeError: If EKM extraction fails.
     """
     if not request.required_verifier_type:
       raise ValueError("At least one required_verifier_type must be specified.")
+
+    label_bytes = label.encode("ascii")
+    ekm_bytes = None
+    first_ekm_exception = None
+    # Attempt to extract EKM using the standard library.
+    # If the standard API fails or is missing, we fallback
+    # to a custom exporter, which uses SSL socket injected in request scope by
+    # middleware.
+    if hasattr(ssl_obj, "export_keying_material"):
+      try:
+        ekm_bytes = ssl_obj.export_keying_material(
+            label_bytes, 32, request.nonce
+        )
+      except Exception as e:
+        # If export_keying_material fails, we will try to extract EKM using
+        # exporter.export_keying_material.
+        logging.exception(
+            "Failed to extract EKM using export_keying_material."
+        )
+        first_ekm_exception = e
+
+    if ekm_bytes is None:
+      target_obj = getattr(ssl_obj, "_sslobj", ssl_obj)
+      ekm_bytes = exporter.export_keying_material(
+          target_obj, 32, label_bytes, context=request.nonce
+      )
+
+    if ekm_bytes is None:
+      if first_ekm_exception:
+        raise RuntimeError(
+            "EKM extraction failed. The initial attempt using"
+            " ssl_obj.export_keying_material failed."
+        ) from first_ekm_exception
+      else:
+        raise RuntimeError(
+            "EKM extraction failed. Both ssl_obj.export_keying_material and"
+            " the fallback exporter failed to extract keying material."
+        )
+
+    public_key, attestation_token = self.token_manager.get_identity_snapshot()
+    token_hash = calculate_fingerprint(attestation_token)
+    signature = self.token_manager.key_manager.sign_payload(
+        ekm_bytes + token_hash.encode("utf-8"))
 
     if (
         attestation_pb2.VerifierType.VERIFIER_TYPE_GCA
@@ -334,7 +400,6 @@ class AttestedTLS:
           f" {request.required_verifier_type}"
       )
 
-    public_key, attestation_token = self.token_manager.get_identity_snapshot()
     response = attestation_pb2.AttestConnectionResponse(
         evidence=[
             attestation_pb2.AttestationEvidence(
@@ -347,8 +412,8 @@ class AttestedTLS:
         instance_public_key=attestation_pb2.EcdsaP256PublicKey(
             key_bytes=public_key
         ),
+        session_signature=signature,
     )
-    # TODO: b/463825032 - Update it to include signed EKM.
     return response
 
 

@@ -20,14 +20,14 @@ import os
 import pathlib
 import random
 import socket
+import ssl
 from unittest import mock
 
 from absl.testing import absltest
 from attested_confidential_inference import attested_tls
 from attested_confidential_inference.proto import attestation_pb2
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
-
-from google3.net.proto2.contrib.pyutil import compare
 
 
 class AttestedTlsTest(absltest.TestCase):
@@ -193,6 +193,28 @@ class AttestedTlsTest(absltest.TestCase):
         attested_tls.calculate_fingerprint(public_key), expected_fingerprint
     )
 
+  def test_key_manager_sign_payload(self):
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    pem_private_bytes = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+
+    private_key_file = self.create_tempfile(content=pem_private_bytes)
+    key_manager = attested_tls.KeyManager(
+        private_key_path=pathlib.Path(private_key_file.full_path)
+    )
+    payload = b"test_payload"
+    signature = key_manager.sign_payload(payload)
+
+    public_key = private_key.public_key()
+    self.assertIsNone(
+        public_key.verify(
+            signature, payload, ec.ECDSA(attested_tls.hashes.SHA256())
+        )
+    )
+
 
 class TokenManagerTest(absltest.TestCase):
 
@@ -205,7 +227,7 @@ class TokenManagerTest(absltest.TestCase):
     self.attestation_token_path = pathlib.Path(
         os.path.join(self.temp_dir.full_path, "attestation_token.txt")
     )
-    self.seeded_random = random.Random(42)
+    self.seeded_rng = random.Random(24)
 
   @mock.patch.object(attested_tls, "get_custom_token_bytes", autospec=True)
   def test_refresh(self, mock_get_custom_token_bytes):
@@ -217,7 +239,7 @@ class TokenManagerTest(absltest.TestCase):
     token_manager = attested_tls.TokenManager(
         key_manager=self.mock_key_manager,
         attestation_token_path=self.attestation_token_path,
-        rng=self.seeded_random,
+        rng=self.seeded_rng,
     )
     token_manager.refresh()
 
@@ -241,10 +263,7 @@ class TokenManagerTest(absltest.TestCase):
   def test_get_public_key(self):
     public_key = b"test_public_key"
     self.mock_key_manager.get_current_public_key.return_value = public_key
-    token_manager = attested_tls.TokenManager(
-        key_manager=self.mock_key_manager,
-        rng=self.seeded_random,
-    )
+    token_manager = attested_tls.TokenManager(key_manager=self.mock_key_manager)
     self.assertEqual(token_manager.get_public_key(), public_key)
     self.mock_key_manager.get_current_public_key.assert_called_once()
 
@@ -265,89 +284,133 @@ class TokenManagerTest(absltest.TestCase):
     )
     self.assertEqual(token_manager.get_attestation_token(), b"")
 
-  def test_get_identity_snapshot(self):
-    public_key = b"test_public_key"
-    attestation_token = b"test_token"
-    self.mock_key_manager.get_current_public_key.return_value = public_key
-    with open(self.attestation_token_path, "wb") as f:
-      f.write(attestation_token)
-    token_manager = attested_tls.TokenManager(
-        key_manager=self.mock_key_manager,
-        attestation_token_path=self.attestation_token_path,
+
+class AttestedTlsImplTest(absltest.TestCase):
+
+  def test_attest_connection_success(self):
+    mock_key_manager = mock.create_autospec(
+        attested_tls.KeyManager, instance=True
     )
-    self.assertEqual(
-        token_manager.get_identity_snapshot(), (public_key, attestation_token)
-    )
-
-
-class AttestedTlsImplTest(absltest.TestCase, compare.Proto2Assertions):
-
-  def test_attest_connection(self):
     mock_token_manager = mock.create_autospec(
-        attested_tls.TokenManager, instance=True, spec_set=True
+        attested_tls.TokenManager, instance=True
     )
+    mock_token_manager.key_manager = mock_key_manager
     public_key = b"test_public_key"
-    attestation_token = "test_attestation_token"
+    attestation_token = b"test_attestation_token"
+    signature = b"test_signature"
+    ekm_bytes = b"test_ekm"
+
     mock_token_manager.get_identity_snapshot.return_value = (
         public_key,
-        attestation_token.encode("utf-8"),
+        attestation_token,
     )
+    mock_token_manager.key_manager.sign_payload.return_value = signature
+
+    mock_ssl_obj = mock.MagicMock()
+    mock_ssl_obj.export_keying_material.return_value = ekm_bytes
 
     attested_tls_instance = attested_tls.AttestedTLS(
         token_manager=mock_token_manager
     )
-
-    request = attested_tls.attestation_pb2.AttestConnectionRequest(
-        required_verifier_type=[
-            attested_tls.attestation_pb2.VerifierType.VERIFIER_TYPE_GCA
-        ]
+    request = attestation_pb2.AttestConnectionRequest(
+        required_verifier_type=[attestation_pb2.VerifierType.VERIFIER_TYPE_GCA],
+        nonce=b"test_nonce",
     )
 
-    response = attested_tls_instance.attest_connection(request)
-    expected_response = attested_tls.attestation_pb2.AttestConnectionResponse(
-        evidence=[
-            attestation_pb2.AttestationEvidence(
-                verifier_type=attestation_pb2.VerifierType.VERIFIER_TYPE_GCA,
-                gca_bundle=attestation_pb2.GcaTrustBundle(
-                    attestation_token=attestation_token
-                ),
-            ),
-        ],
-        instance_public_key=attestation_pb2.EcdsaP256PublicKey(
-            key_bytes=public_key
-        ),
+    response = attested_tls_instance.attest_connection(
+        request, ssl_obj=mock_ssl_obj, label="test_label"
     )
-    self.assertProto2Equal(response, expected_response)
+
+    with self.subTest(name="EvidencePopulated"):
+      self.assertEqual(
+          response.evidence[0].gca_bundle.attestation_token.encode("utf-8"),
+          attestation_token,
+      )
+      self.assertEqual(response.session_signature, signature)
+
+    with self.subTest(name="PublicKeyPopulated"):
+      self.assertEqual(response.instance_public_key.key_bytes, public_key)
+    with self.subTest(name="EKMSigned"):
+      mock_token_manager.key_manager.sign_payload.assert_called_once_with(
+          ekm_bytes
+          + hashlib.sha256(attestation_token).hexdigest().encode("utf-8")
+      )
+
+  @mock.patch.object(attested_tls.exporter, "export_keying_material", autospec=True)
+  def test_attest_connection_ekm_extraction_fails(
+      self, mock_export_keying_material
+  ):
+    mock_export_keying_material.return_value = None
+    mock_ssl_obj = mock.MagicMock()
+    mock_ssl_obj.export_keying_material.side_effect = Exception("EKM failed")
+    mock_token_manager = mock.create_autospec(
+        attested_tls.TokenManager, instance=True
+    )
+    mock_token_manager.key_manager = mock.create_autospec(
+        attested_tls.KeyManager, instance=True
+    )
+    attested_tls_instance = attested_tls.AttestedTLS(
+        token_manager=mock_token_manager
+    )
+    request = attestation_pb2.AttestConnectionRequest(
+        required_verifier_type=[attestation_pb2.VerifierType.VERIFIER_TYPE_GCA],
+    )
+
+    with self.assertRaisesRegex(
+        RuntimeError,
+        "EKM extraction failed. The initial attempt using"
+        " ssl_obj.export_keying_material failed.",
+    ):
+      attested_tls_instance.attest_connection(
+          request, ssl_obj=mock_ssl_obj, label="test_label"
+      )
+    mock_export_keying_material.assert_called_once()
 
   def test_attest_connection_no_verifier(self):
     mock_token_manager = mock.create_autospec(
-        attested_tls.TokenManager, instance=True, spec_set=True
+        attested_tls.TokenManager, instance=True
     )
     attested_tls_instance = attested_tls.AttestedTLS(
         token_manager=mock_token_manager
     )
-    request = attested_tls.attestation_pb2.AttestConnectionRequest()
+    request = attestation_pb2.AttestConnectionRequest()
     with self.assertRaisesRegex(
-        ValueError, "At least one required_verifier_type must be specified"
+        ValueError, "At least one required_verifier_type must be specified."
     ):
-      attested_tls_instance.attest_connection(request)
+      attested_tls_instance.attest_connection(
+          request, ssl_obj=mock.MagicMock(), label="l"
+      )
 
   def test_attest_connection_unsupported_verifier(self):
-    mock_token_manager = mock.create_autospec(
-        attested_tls.TokenManager, instance=True, spec_set=True
+    mock_key_manager = mock.create_autospec(
+        attested_tls.KeyManager, instance=True
     )
+    mock_token_manager = mock.create_autospec(
+        attested_tls.TokenManager, instance=True
+    )
+    mock_token_manager.key_manager = mock_key_manager
+    mock_token_manager.get_identity_snapshot.return_value = (
+        b"pk",
+        b"token",
+    )
+    mock_token_manager.key_manager.sign_payload.return_value = b"sig"
+    mock_ssl_obj = mock.MagicMock()
+    mock_ssl_obj.export_keying_material.return_value = b"ekm"
+
     attested_tls_instance = attested_tls.AttestedTLS(
         token_manager=mock_token_manager
     )
-    request = attested_tls.attestation_pb2.AttestConnectionRequest(
+    request = attestation_pb2.AttestConnectionRequest(
         required_verifier_type=[
-            attested_tls.attestation_pb2.VerifierType.VERIFIER_TYPE_UNSPECIFIED
+            attestation_pb2.VerifierType.VERIFIER_TYPE_UNSPECIFIED
         ]
     )
     with self.assertRaisesRegex(
-        ValueError, "Unsupported verifier types requested"
+        ValueError, "Unsupported verifier types requested:"
     ):
-      attested_tls_instance.attest_connection(request)
+      attested_tls_instance.attest_connection(
+          request, ssl_obj=mock_ssl_obj, label="l"
+      )
 
 
 if __name__ == "__main__":
