@@ -1,11 +1,27 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """WSGI middleware for handling attested TLS connections."""
 
 import json
 import logging
 from typing import Any, Iterable
 
-from attested_confidential_inference import attested_tls as at
-from attested_confidential_inference.proto import attestation_pb2
+from prompt_encryption_sdk.proto import attestation_pb2
+from prompt_encryption_sdk.server import attestation
+from prompt_encryption_sdk.server import keys
+from prompt_encryption_sdk.server import token
 from google.protobuf import json_format
 import gunicorn.app.base
 from gunicorn.http import wsgi as gunicorn_wsgi
@@ -22,14 +38,14 @@ def _patched_wsgi_create(req, *args, **kwargs):
   resp, environ = _original_create(req, *args, **kwargs)
   # Check if our Custom Worker attached the socket
   if hasattr(req, "confidential_socket"):
-    environ["confidential_inference.socket"] = req.confidential_socket
+    environ["prompt_encryption.socket"] = req.confidential_socket
   return resp, environ
 
 
 gunicorn_wsgi.create = _patched_wsgi_create
 
 
-class ConfidentialGunicornWorker(sync.SyncWorker):
+class PromptEncryptionGunicornWorker(sync.SyncWorker):
   """Captures the raw SSLSocket immediately after the handshake."""
 
   def handle_request(self, listener, req, client, addr):
@@ -42,16 +58,16 @@ class ConfidentialGunicornWorker(sync.SyncWorker):
     return f"<{self.__class__.__name__} pid={self.pid}>"
 
 
-class ConfidentialWSGIMiddleware:
+class PromptEncryptionWSGIMiddleware:
   """WSGI middleware for handling attested TLS connections.
 
   Attributes:
     app: The WSGI application to wrap.
-    attested_tls: An instance of `attested_tls.AttestedTLS` used for handling
+    attested_tls: An instance of `attestation.AttestedTLS` used for handling
       attestation.
   """
 
-  def __init__(self, app, attested_tls: at.AttestedTLS):
+  def __init__(self, app, attested_tls: attestation.AttestedTLS):
     self.app = app
     self.attested_tls = attested_tls
 
@@ -99,10 +115,10 @@ class ConfidentialWSGIMiddleware:
       body, data = self._parse_request(environ)
       req = json_format.Parse(body, attestation_pb2.AttestConnectionRequest())
 
-      label = data.get("label", "EXPORTER-Confidential-Inference")
+      label = data.get("label", "EXPORTER-Prompt-Encryption-SDK")
 
       # Get socket from environ (injected by our patched gunicorn/worker)
-      ssl_obj = environ.get("confidential_inference.socket")
+      ssl_obj = environ.get("prompt_encryption.socket")
 
       if not ssl_obj:
         raise RuntimeError(
@@ -175,25 +191,25 @@ class _StandaloneApplication(gunicorn.app.base.BaseApplication):
 def run_gunicorn_app(
     app,
     *,
-    key_manager: at.KeyManager | None = None,
-    token_manager: at.TokenManager | None = None,
+    key_manager: keys.KeyManager | None = None,
+    token_manager: token.TokenManager | None = None,
     host: str = "0.0.0.0",
     port: int = 8443,
     workers: int = 1,
     ssl_certfile: str | None = None,
     ssl_keyfile: str | None = None,
-    attested_tls_cls: type[at.AttestedTLS] = at.AttestedTLS,
+    attested_tls_cls: type[attestation.AttestedTLS] = attestation.AttestedTLS,
     standalone_app_cls: type[gunicorn.app.base.BaseApplication] = (
         _StandaloneApplication
     ),
     **kwargs,
 ):
-  """Runs a WSGI app with ConfidentialWSGIMiddleware using Gunicorn.
+  """Runs a WSGI app with PromptEncryptionWSGIMiddleware using Gunicorn.
 
   Args:
     app: The WSGI application to run.
-    key_manager: An optional at.KeyManager instance.
-    token_manager: An optional at.TokenManager instance.
+    key_manager: An optional keys.KeyManager instance.
+    token_manager: An optional token.TokenManager instance.
     host: Host to bind to.
     port: Port to bind to.
     workers: Number of workers.
@@ -204,19 +220,19 @@ def run_gunicorn_app(
     **kwargs: Additional keyword arguments to pass to Gunicorn options.
   """
   if key_manager is None:
-    key_manager = at.KeyManager()
+    key_manager = keys.KeyManager()
   if token_manager is None:
-    token_manager = at.TokenManager(key_manager=key_manager)
+    token_manager = token.TokenManager(key_manager=key_manager)
 
   with token_manager:
     atls = attested_tls_cls(token_manager)
-    middleware_app = ConfidentialWSGIMiddleware(app, atls)
+    middleware_app = PromptEncryptionWSGIMiddleware(app, atls)
 
     options = {
         "bind": f"{host}:{port}",
         "workers": workers,
         # Use our Custom Worker to capture sockets.
-        "worker_class": ConfidentialGunicornWorker,
+        "worker_class": PromptEncryptionGunicornWorker,
         "certfile": ssl_certfile,
         "keyfile": ssl_keyfile,
         "accesslog": "-",

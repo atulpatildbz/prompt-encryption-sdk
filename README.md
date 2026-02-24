@@ -31,28 +31,37 @@ with client.session() as session:
 
 ## Server Side Primitives
 
-This library provides the low-level primitives for implementing an Attested TLS server. Note that high-level WSGI/ASGI middlewares are not included in this package and must be implemented by the application.
+This library provides low-level primitives for implementing an Attested TLS server. High-level WSGI/ASGI middlewares are also available in `attested_confidential_inference.server`.
 
 ```python
-from attested_confidential_inference import attested_tls
+from attested_confidential_inference import server
 from attested_confidential_inference.proto import attestation_pb2
 
 # 1. Initialize Key and Token Managers (handles key rotation and GCA tokens)
-key_manager = attested_tls.KeyManager()
-token_manager = attested_tls.TokenManager(key_manager=key_manager)
-token_manager.start()
+key_manager = server.KeyManager()
+token_manager = server.TokenManager(key_manager=key_manager)
 
 # 2. Initialize the Attestation Engine
-attested_server = attested_tls.AttestedTLS(token_manager=token_manager)
+attested_server = server.AttestedTLS(token_manager=token_manager)
 
 # 3. Handle Attestation Requests (e.g., inside a connection handler)
-def handle_attestation(request_proto):
+# `ssl_obj` is the SSL socket object from the connection.
+def handle_attestation(request_proto, ssl_obj):
     try:
-        response = attested_server.attest_connection(request_proto)
+        response = attested_server.attest_connection(
+            request_proto, ssl_obj=ssl_obj, label="EXPORTER-Confidential-Inference"
+        )
         return response
     except ValueError as e:
         # Handle validation errors
         print(f"Attestation failed: {e}")
+
+# The token manager runs in a separate thread for key/token rotation and
+# must be used as a context manager:
+with token_manager:
+    # Your server logic that uses handle_attestation would go here.
+    # For example, handling requests to '/_attest-connection'.
+    print("Server running with token manager...")
 ```
 
 

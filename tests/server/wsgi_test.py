@@ -1,31 +1,49 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for server.wsgi."""
+
 import json
 from unittest import mock
 
 from absl.testing import absltest
-from attested_confidential_inference import attested_tls as at
-from attested_confidential_inference import wsgi_middleware
-from attested_confidential_inference.proto import attestation_pb2
+from prompt_encryption_sdk.proto import attestation_pb2
+from prompt_encryption_sdk.server import attestation
+from prompt_encryption_sdk.server import keys
+from prompt_encryption_sdk.server import token
+from prompt_encryption_sdk.server import wsgi
 from google.protobuf import json_format
 import werkzeug.test
 
-from google3.net.proto2.contrib.pyutil import compare
 
 
-class ConfidentialWSGIMiddlewareTest(
-    absltest.TestCase, compare.Proto2Assertions
+
+class PromptEncryptionWSGIMiddlewareTest(
+    absltest.TestCase
 ):
 
   def setUp(self):
     super().setUp()
-    self.mock_attested_tls = mock.create_autospec(at.AttestedTLS, instance=True)
+    self.mock_attested_tls = mock.create_autospec(
+        attestation.AttestedTLS, instance=True
+    )
 
     def simple_app(unused_environ, unused_start_response):
       pass
 
     self.app = mock.create_autospec(simple_app)
-    self.mw = wsgi_middleware.ConfidentialWSGIMiddleware(
-        self.app, self.mock_attested_tls
-    )
+    self.mw = wsgi.PromptEncryptionWSGIMiddleware(self.app, self.mock_attested_tls)
     self.client = werkzeug.test.Client(self.mw)
 
   def test_call_other_path(self):
@@ -51,7 +69,7 @@ class ConfidentialWSGIMiddlewareTest(
     self.mock_attested_tls.attest_connection.return_value = response_proto
 
     # Mock the socket injection in environ
-    environ_overrides = {"confidential_inference.socket": mock.Mock()}
+    environ_overrides = {"prompt_encryption.socket": mock.Mock()}
 
     response = self.client.post(
         "/_attest-connection",
@@ -61,15 +79,15 @@ class ConfidentialWSGIMiddlewareTest(
 
     self.mock_attested_tls.attest_connection.assert_called_once_with(
         request_proto,
-        ssl_obj=environ_overrides["confidential_inference.socket"],
-        label="EXPORTER-Confidential-Inference",
+        ssl_obj=environ_overrides["prompt_encryption.socket"],
+        label="EXPORTER-Prompt-Encryption-SDK",
     )
     self.assertEqual(response.status_code, 200)
 
     response_proto_parsed = json_format.Parse(
         response.data, attestation_pb2.AttestConnectionResponse()
     )
-    self.assertProto2Equal(response_proto_parsed, response_proto)
+    self.assertEqual(response_proto_parsed, response_proto)
 
   def test_handle_attestation_missing_socket(self):
     request_proto = attestation_pb2.AttestConnectionRequest()
@@ -88,9 +106,9 @@ class ConfidentialWSGIMiddlewareTest(
     # Mock json_format.Parse to simulate a protobuf parsing error, as it is difficult
     # to trigger a pure ParseError with standard JSON inputs due to permissive parsing.
     with mock.patch.object(
-        wsgi_middleware.json_format,
+        wsgi.json_format,
         "Parse",
-        side_effect=wsgi_middleware.json_format.ParseError("test"),
+        side_effect=wsgi.json_format.ParseError("test"),
     ):
       response = self.client.post("/_attest-connection", json={})
       self.assertEqual(response.status_code, 400)
@@ -100,7 +118,7 @@ class ConfidentialWSGIMiddlewareTest(
     request_proto = attestation_pb2.AttestConnectionRequest()
     request_json = json_format.MessageToJson(request_proto)
 
-    environ_overrides = {"confidential_inference.socket": mock.Mock()}
+    environ_overrides = {"prompt_encryption.socket": mock.Mock()}
 
     self.mock_attested_tls.attest_connection.side_effect = ValueError(
         "test error"
@@ -117,15 +135,17 @@ class ConfidentialWSGIMiddlewareTest(
 
   def test_run_gunicorn_app(self):
     mock_app = mock.Mock()
-    mock_key_manager = mock.create_autospec(at.KeyManager, instance=True)
-    mock_token_manager = mock.create_autospec(at.TokenManager, instance=True)
-    mock_attested_tls_cls = mock.create_autospec(at.AttestedTLS, instance=False)
+    mock_key_manager = mock.create_autospec(keys.KeyManager, instance=True)
+    mock_token_manager = mock.create_autospec(token.TokenManager, instance=True)
+    mock_attested_tls_cls = mock.create_autospec(
+        attestation.AttestedTLS, instance=False
+    )
     mock_standalone_app_cls = mock.create_autospec(
-        wsgi_middleware._StandaloneApplication, instance=False
+        wsgi._StandaloneApplication, instance=False
     )
     mock_standalone_app_instance = mock_standalone_app_cls.return_value
 
-    wsgi_middleware.run_gunicorn_app(
+    wsgi.run_gunicorn_app(
         mock_app,
         key_manager=mock_key_manager,
         token_manager=mock_token_manager,
@@ -144,7 +164,7 @@ class ConfidentialWSGIMiddlewareTest(
           {
               "bind": "localhost:9000",
               "workers": 1,
-              "worker_class": wsgi_middleware.ConfidentialGunicornWorker,
+              "worker_class": wsgi.PromptEncryptionGunicornWorker,
               "certfile": None,
               "keyfile": None,
               "accesslog": "-",
@@ -156,7 +176,7 @@ class ConfidentialWSGIMiddlewareTest(
   def test_middleware_repr(self):
     self.assertEqual(
         repr(self.mw),
-        f"<ConfidentialWSGIMiddleware app={self.app!r}>",
+        f"<PromptEncryptionWSGIMiddleware app={self.app!r}>",
     )
 
   def test_patched_wsgi_create(self):
@@ -165,12 +185,12 @@ class ConfidentialWSGIMiddlewareTest(
     mock_environ = {}
 
     with mock.patch.object(
-        wsgi_middleware, "_original_create", return_value=("resp", mock_environ)
+        wsgi, "_original_create", return_value=("resp", mock_environ)
     ) as mock_original:
-      resp, environ = wsgi_middleware._patched_wsgi_create(mock_req)
+      resp, environ = wsgi._patched_wsgi_create(mock_req)
 
     self.assertEqual(resp, "resp")
-    self.assertEqual(environ["confidential_inference.socket"], "socket_obj")
+    self.assertEqual(environ["prompt_encryption.socket"], "socket_obj")
     mock_original.assert_called_once_with(mock_req)
 
   def test_patched_wsgi_create_no_socket(self):
@@ -179,12 +199,12 @@ class ConfidentialWSGIMiddlewareTest(
     mock_environ = {}
 
     with mock.patch.object(
-        wsgi_middleware, "_original_create", return_value=("resp", mock_environ)
+        wsgi, "_original_create", return_value=("resp", mock_environ)
     ) as mock_original:
-      resp, environ = wsgi_middleware._patched_wsgi_create(mock_req)
+      resp, environ = wsgi._patched_wsgi_create(mock_req)
 
     self.assertEqual(resp, "resp")
-    self.assertNotIn("confidential_inference.socket", environ)
+    self.assertNotIn("prompt_encryption.socket", environ)
     mock_original.assert_called_once_with(mock_req)
 
   def _create_worker(self):
@@ -204,7 +224,7 @@ class ConfidentialWSGIMiddlewareTest(
 
     # Create the worker instance
     with mock.patch("os.chown"):
-      worker = wsgi_middleware.ConfidentialGunicornWorker(
+      worker = wsgi.PromptEncryptionGunicornWorker(
           mock_age,
           mock_ppid,
           mock_sockets,
@@ -220,7 +240,7 @@ class ConfidentialWSGIMiddlewareTest(
     # Manually set pid since it's set in __init__ but we want to be sure
     worker.pid = 12345
 
-    self.assertEqual(repr(worker), "<ConfidentialGunicornWorker pid=12345>")
+    self.assertEqual(repr(worker), "<PromptEncryptionGunicornWorker pid=12345>")
 
   def test_worker_handle_request(self):
     worker = self._create_worker()
@@ -255,11 +275,11 @@ class ConfidentialWSGIMiddlewareTest(
   def test_parse_request_error_handling(self):
     # Force _parse_request to hit the except block
     with mock.patch.object(
-        wsgi_middleware.werkzeug.wrappers,
+        wsgi.werkzeug.wrappers,
         "Request",
         side_effect=Exception("Boom"),
     ):
-      environ_overrides = {"confidential_inference.socket": mock.Mock()}
+      environ_overrides = {"prompt_encryption.socket": mock.Mock()}
       self.mock_attested_tls.attest_connection.return_value = (
           attestation_pb2.AttestConnectionResponse()
       )
@@ -284,7 +304,7 @@ class StandaloneApplicationTest(absltest.TestCase):
     with mock.patch(
         "gunicorn.app.base.BaseApplication.__init__", return_value=None
     ):
-      sa = wsgi_middleware._StandaloneApplication(app, options)
+      sa = wsgi._StandaloneApplication(app, options)
       # Manually set attributes normally set by __init__
       sa.application = app
       sa.options = options

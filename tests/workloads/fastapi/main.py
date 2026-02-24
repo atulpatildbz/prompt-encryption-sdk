@@ -5,7 +5,7 @@ import datetime
 import os
 import tempfile
 
-from prompt_encryption_sdk import middleware
+from prompt_encryption_sdk.server import asgi as middleware
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives import serialization
