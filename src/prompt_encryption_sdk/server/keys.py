@@ -29,8 +29,8 @@ class KeyManager:
   def __init__(
       self,
       *,
-      private_key_path: pathlib.Path = pathlib.Path("private_key.pem"),
-      public_key_path: pathlib.Path = pathlib.Path("public_key.pem"),
+      private_key_path: pathlib.Path = pathlib.Path("/dev/shm/private_key.pem"),
+      public_key_path: pathlib.Path = pathlib.Path("/dev/shm/public_key.pem"),
       write_file_fn: common.FileWriter | None = None,
       read_file_fn: common.FileReader | None = None,
   ):
