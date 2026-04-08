@@ -14,16 +14,18 @@
 
 """Token management logic for Prompt Encryption SDK."""
 
+from collections.abc import Callable, Sequence
 import http.client
 import json
+import os
 import pathlib
 import random
 import socket  # Needed for AF_UNIX
-import sys
+import subprocess
 import threading
 import time
 import types
-from typing import Any, Callable
+from typing import Any
 
 from absl import logging
 from prompt_encryption_sdk.server import common
@@ -64,7 +66,7 @@ class UnixSocketConnection(http.client.HTTPConnection):
     return f"UnixSocketConnection(socket_path={self.socket_path!r})"
 
 
-def get_custom_token_bytes(
+def get_cs_token_bytes(
     socket_path: pathlib.Path = pathlib.Path(TEE_SERVER_SOCKET_PATH),
     connection_factory: Callable[
         [pathlib.Path], http.client.HTTPConnection
@@ -80,6 +82,12 @@ def get_custom_token_bytes(
 
     response = conn.getresponse()
     if response.status >= 400:
+      logging.error(
+          "HTTP Error %s: %s for request body: %s",
+          response.status,
+          response.reason,
+          body,
+      )
       raise RuntimeError(
           f"HTTP Error {response.status}: {response.reason} for request body:"
           f" {body}"
@@ -89,6 +97,30 @@ def get_custom_token_bytes(
         "Successfully retrieved attestation token from socket: %s", socket_path
     )
     return response.read()
+
+
+def get_cvm_token_bytes(audience: str, nonces: Sequence[str]) -> bytes:
+  """Retrieves custom attestation token bytes via gotpm token CLI.
+
+  Args:
+    audience: The audience for the token.
+    nonces: A sequence of nonces to include in the token.
+
+  Returns:
+    The attestation token bytes.
+
+  Raises:
+    RuntimeError: If the gotpm token command fails.
+  """
+  cmd = ["gotpm", "token", "--audience", audience]
+  for n in nonces:
+    cmd.extend(["--custom-nonce", n])
+  result = subprocess.run(cmd, capture_output=True, check=False)
+  if result.returncode != 0:
+    logging.error("gotpm token failed: %r", result.stderr)
+    raise RuntimeError(f"gotpm token failed: {result.stderr!r}")
+  logging.info("Successfully retrieved attestation token from gotpm")
+  return result.stdout.strip()
 
 
 class TokenManager:
@@ -119,6 +151,24 @@ class TokenManager:
         f" jitter_window_seconds={self.jitter_window_seconds!r}"
     )
 
+  @staticmethod
+  def _fetch_attestation_token(public_key_fingerprint: str) -> bytes:
+    """Attempts to fetch attestation token based on configured attestation type."""
+    attestation_type = os.environ.get("ATTESTATION_TYPE", "uds").lower()
+
+    if attestation_type == "uds":
+      return get_cs_token_bytes(
+          audience=DEFAULT_AUDIENCE,
+          token_type=TOKEN_TYPE,
+          nonces=[public_key_fingerprint],
+      )
+    elif attestation_type == "gotpm":
+      return get_cvm_token_bytes(
+          audience=DEFAULT_AUDIENCE, nonces=[public_key_fingerprint]
+      )
+    else:
+      raise ValueError(f"Unknown ATTESTATION_TYPE {attestation_type!r}.")
+
   def refresh(self) -> None:
     """Refreshes the public key and attestation token and saves them to files."""
     logging.info("Refreshing keys and attestation token...")
@@ -127,11 +177,7 @@ class TokenManager:
       public_key = self.key_manager.get_current_public_key()
       public_key_fingerprint = keys.calculate_fingerprint(public_key)
 
-      attestation_token = get_custom_token_bytes(
-          audience=DEFAULT_AUDIENCE,
-          token_type=TOKEN_TYPE,
-          nonces=[public_key_fingerprint],
-      )
+      attestation_token = self._fetch_attestation_token(public_key_fingerprint)
       common.write_file(self.attestation_token_path, attestation_token, 0o644)
     logging.info("Refresh complete.")
 

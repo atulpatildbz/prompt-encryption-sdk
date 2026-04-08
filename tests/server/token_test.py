@@ -20,16 +20,23 @@ import os
 import pathlib
 import random
 import socket
+import subprocess
 from unittest import mock
 
 from absl.testing import absltest
+from absl.testing import parameterized
 from prompt_encryption_sdk.server import keys
 from prompt_encryption_sdk.server import token
 
 
+class _FakeHTTPResponse(http.client.HTTPResponse):
+  status: int = 200
+  reason: str = "OK"
+
+
 class TokenTest(absltest.TestCase):
 
-  def test_get_custom_token_bytes_success(self):
+  def test_get_cs_token_bytes_success(self):
     mock_conn = mock.create_autospec(
         token.UnixSocketConnection, instance=True, spec_set=True
     )
@@ -37,7 +44,7 @@ class TokenTest(absltest.TestCase):
     mock_conn.__exit__.return_value = None
 
     mock_response = mock.create_autospec(
-        http.client.HTTPResponse, instance=True, spec_set=False
+        _FakeHTTPResponse, instance=True, spec_set=True
     )
     mock_response.status = 200
     mock_response.read.return_value = b"test_token"
@@ -50,7 +57,7 @@ class TokenTest(absltest.TestCase):
     mock_connection_factory.return_value = mock_conn
     mock.seal(mock_connection_factory)
 
-    token_bytes = token.get_custom_token_bytes(
+    token_bytes = token.get_cs_token_bytes(
         socket_path=pathlib.Path("test_socket"),
         connection_factory=mock_connection_factory,
         audience="test_audience",
@@ -65,20 +72,68 @@ class TokenTest(absltest.TestCase):
         headers={"Content-Type": "application/json"},
     )
 
-  def test_get_custom_token_bytes_error(self):
-    mock_conn = mock.MagicMock()
+  def test_get_cs_token_bytes_error(self):
+    mock_conn = mock.create_autospec(
+        token.UnixSocketConnection, instance=True, spec_set=True
+    )
     mock_conn.__enter__.return_value = mock_conn
 
-    mock_response = mock.MagicMock()
+    mock_response = mock.create_autospec(
+        _FakeHTTPResponse, instance=True, spec_set=True
+    )
     mock_response.status = 400
     mock_response.reason = "Bad Request"
     mock_conn.getresponse.return_value = mock_response
-    mock_connection_factory = mock.MagicMock(return_value=mock_conn)
+    mock_connection_factory = mock.create_autospec(
+        token.UnixSocketConnection, instance=False, spec_set=True
+    )
+    mock_connection_factory.return_value = mock_conn
 
     with self.assertRaisesRegex(RuntimeError, "HTTP Error 400: Bad Request"):
-      token.get_custom_token_bytes(
+      token.get_cs_token_bytes(
           connection_factory=mock_connection_factory, audience="test_audience"
       )
+
+  @mock.patch.object(subprocess, "run", autospec=True)
+  def test_get_cvm_token_bytes_success(self, mock_run):
+    mock_result = mock.create_autospec(
+        subprocess.CompletedProcess, instance=True
+    )
+    mock_result.stdout = b"test_token\n"
+    mock_result.returncode = 0
+    mock_run.return_value = mock_result
+
+    token_bytes = token.get_cvm_token_bytes(
+        "test_audience", ["nonce1", "nonce2"]
+    )
+
+    self.assertEqual(token_bytes, b"test_token")
+    mock_run.assert_called_once_with(
+        [
+            "gotpm",
+            "token",
+            "--audience",
+            "test_audience",
+            "--custom-nonce",
+            "nonce1",
+            "--custom-nonce",
+            "nonce2",
+        ],
+        capture_output=True,
+        check=False,
+    )
+
+  @mock.patch.object(subprocess, "run", autospec=True)
+  def test_get_cvm_token_bytes_error(self, mock_run):
+    mock_result = mock.create_autospec(
+        subprocess.CompletedProcess, instance=True
+    )
+    mock_result.returncode = 1
+    mock_result.stderr = b"test error"
+    mock_run.return_value = mock_result
+
+    with self.assertRaisesRegex(RuntimeError, "test error"):
+      token.get_cvm_token_bytes("test_audience", ["nonce1"])
 
   @mock.patch.object(socket, "socket", autospec=True)
   def test_unix_socket_connection_connect(self, mock_socket):
@@ -89,7 +144,7 @@ class TokenTest(absltest.TestCase):
       conn.sock.connect.assert_called_once_with(socket_path)
 
 
-class TokenManagerTest(absltest.TestCase):
+class TokenManagerTest(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()
@@ -102,36 +157,112 @@ class TokenManagerTest(absltest.TestCase):
     )
     self.seeded_rng = random.Random(24)
 
-  @mock.patch.object(token, "get_custom_token_bytes", autospec=True)
-  def test_refresh(self, mock_get_custom_token_bytes):
-    public_key = b"test_public_key"
-    public_key_fingerprint = hashlib.sha256(public_key).hexdigest()
-    self.mock_key_manager.get_current_public_key.return_value = public_key
-    mock_get_custom_token_bytes.return_value = b"test_token"
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="default_cs",
+          env_vars={},
+          mock_cs_return=b"test_token",
+          mock_cvm_return=None,
+          expect_cs_call=True,
+          expect_cvm_call=False,
+          expected_token=b"test_token",
+          expected_error=None,
+          expected_error_regex=None,
+      ),
+      dict(
+          testcase_name="explicit_cs",
+          env_vars={"ATTESTATION_TYPE": "uds"},
+          mock_cs_return=b"test_token",
+          mock_cvm_return=None,
+          expect_cs_call=True,
+          expect_cvm_call=False,
+          expected_token=b"test_token",
+          expected_error=None,
+          expected_error_regex=None,
+      ),
+      dict(
+          testcase_name="explicit_cvm",
+          env_vars={"ATTESTATION_TYPE": "gotpm"},
+          mock_cs_return=None,
+          mock_cvm_return=b"cvm_test_token",
+          expect_cs_call=False,
+          expect_cvm_call=True,
+          expected_token=b"cvm_test_token",
+          expected_error=None,
+          expected_error_regex=None,
+      ),
+      dict(
+          testcase_name="unknown_tee",
+          env_vars={"ATTESTATION_TYPE": "unknown"},
+          mock_cs_return=None,
+          mock_cvm_return=None,
+          expect_cs_call=False,
+          expect_cvm_call=False,
+          expected_token=None,
+          expected_error=ValueError,
+          expected_error_regex="Unknown ATTESTATION_TYPE 'unknown'.",
+      ),
+  )
+  @mock.patch.object(token, "get_cvm_token_bytes", autospec=True)
+  @mock.patch.object(token, "get_cs_token_bytes", autospec=True)
+  def test_refresh_environments(
+      self,
+      mock_get_cs_token_bytes,
+      mock_get_cvm_token_bytes,
+      env_vars,
+      mock_cs_return,
+      mock_cvm_return,
+      expect_cs_call,
+      expect_cvm_call,
+      expected_token,
+      expected_error,
+      expected_error_regex,
+  ):
+    with mock.patch.dict(os.environ, env_vars, clear=True):
+      public_key = b"test_public_key"
+      public_key_fingerprint = hashlib.sha256(public_key).hexdigest()
+      self.mock_key_manager.get_current_public_key.return_value = public_key
 
-    token_manager = token.TokenManager(
-        key_manager=self.mock_key_manager,
-        attestation_token_path=self.attestation_token_path,
-        rng=self.seeded_rng,
-    )
-    token_manager.refresh()
+      if mock_cs_return is not None:
+        mock_get_cs_token_bytes.return_value = mock_cs_return
+      if mock_cvm_return is not None:
+        mock_get_cvm_token_bytes.return_value = mock_cvm_return
 
-    with self.subTest(name="KeyPairGenerated"):
-      self.mock_key_manager.generate_key_pair.assert_called_once()
-
-    with self.subTest(name="PublicKeyRetrieved"):
-      self.mock_key_manager.get_current_public_key.assert_called_once()
-
-    with self.subTest(name="CustomTokenRequested"):
-      mock_get_custom_token_bytes.assert_called_once_with(
-          audience="https://sts.google.com",
-          token_type="OIDC",
-          nonces=[public_key_fingerprint],
+      token_manager = token.TokenManager(
+          key_manager=self.mock_key_manager,
+          attestation_token_path=self.attestation_token_path,
+          rng=self.seeded_rng,
       )
 
-    with self.subTest(name="AttestationTokenWritten"):
-      with open(self.attestation_token_path, "rb") as f:
-        self.assertEqual(f.read(), b"test_token")
+      if expected_error:
+        with self.assertRaisesRegex(expected_error, expected_error_regex):
+          token_manager.refresh()
+      else:
+        token_manager.refresh()
+
+      if expect_cs_call:
+        mock_get_cs_token_bytes.assert_called_once_with(
+            audience="https://sts.google.com",
+            token_type="OIDC",
+            nonces=[public_key_fingerprint],
+        )
+      else:
+        mock_get_cs_token_bytes.assert_not_called()
+
+      if expect_cvm_call:
+        mock_get_cvm_token_bytes.assert_called_once_with(
+            audience="https://sts.google.com", nonces=[public_key_fingerprint]
+        )
+      else:
+        mock_get_cvm_token_bytes.assert_not_called()
+
+      if not expected_error:
+        with open(self.attestation_token_path, "rb") as f:
+          actual_token = f.read()
+          if expected_token == b"":
+            self.assertEmpty(actual_token)
+          else:
+            self.assertEqual(actual_token, expected_token)
 
   def test_get_public_key(self):
     public_key = b"test_public_key"
@@ -155,7 +286,7 @@ class TokenManagerTest(absltest.TestCase):
         key_manager=self.mock_key_manager,
         attestation_token_path="/nonexistent/path",
     )
-    self.assertEqual(token_manager.get_attestation_token(), b"")
+    self.assertEmpty(token_manager.get_attestation_token())
 
 
 if __name__ == "__main__":
