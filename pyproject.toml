@@ -4,7 +4,7 @@ requires = ["setuptools>=61.0", "wheel", "grpcio-tools"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "google-cloud-confidential-inference"
+name = "google-cloud-prompt-encryption-sdk"
 version = "0.1.0"
 description = "A library for Confidential Inference that establishes an end-to-end, attested TLS channel to a workload in a Trusted Execution Environment (TEE)."
 readme = "README.md"
