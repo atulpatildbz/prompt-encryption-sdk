@@ -18,6 +18,7 @@ from collections.abc import Mapping
 import hashlib
 import json
 import logging
+import ssl
 import types
 from typing import Any
 
@@ -77,7 +78,8 @@ class OIDCTokenValidator:
       )
 
     # Initialize PyJWT's JWKS Client with the resolved URI
-    self._jwks_client = jwt.PyJWKClient(jwks_uri)
+    ssl_context = ssl.create_default_context(cafile=requests.certs.where())
+    self._jwks_client = jwt.PyJWKClient(jwks_uri, ssl_context=ssl_context)
 
   def validate_token(self, token: str) -> dict[str, Any]:
     """Decodes and validates the OIDC token signature and standard claims.
