@@ -1,18 +1,18 @@
-# Attested Confidential Inference
+# Prompt Encryption SDK
 
-A library for Confidential Inference that establishes an end-to-end, attested TLS channel to a workload in a Trusted Execution Environment (TEE).
+A library for Prompt Encryption SDK that establishes an end-to-end, attested TLS channel to a workload in a Trusted Execution Environment (TEE).
 
 ## Installation
 
 ```bash
-pip install google-cloud-confidential-inference
+pip install google-cloud-prompt-encryption-sdk
 ```
 
 ## Usage
 
 ```python
-from attested_confidential_inference.client import PromptEncryptionClient
-from attested_confidential_inference.proto import attestation_pb2
+from prompt_encryption_sdk.client import PromptEncryptionClient
+from prompt_encryption_sdk.proto import attestation_pb2
 
 # Define the attestation policy
 policy = attestation_pb2.AttestationPolicy(
@@ -31,11 +31,11 @@ with client.session() as session:
 
 ## Server Side Primitives
 
-This library provides low-level primitives for implementing an Attested TLS server. High-level WSGI/ASGI middlewares are also available in `attested_confidential_inference.server`.
+This library provides low-level primitives for implementing an Attested TLS server. High-level WSGI/ASGI middlewares are also available in `prompt_encryption_sdk.server`.
 
 ```python
-from attested_confidential_inference import server
-from attested_confidential_inference.proto import attestation_pb2
+from prompt_encryption_sdk import server
+from prompt_encryption_sdk.proto import attestation_pb2
 
 # 1. Initialize Key and Token Managers (handles key rotation and GCA tokens)
 key_manager = server.KeyManager()
@@ -49,7 +49,7 @@ attested_server = server.AttestedTLS(token_manager=token_manager)
 def handle_attestation(request_proto, ssl_obj):
     try:
         response = attested_server.attest_connection(
-            request_proto, ssl_obj=ssl_obj, label="EXPORTER-Confidential-Inference"
+            request_proto, ssl_obj=ssl_obj, label="EXPORTER-Prompt-Encryption-SDK"
         )
         return response
     except ValueError as e:
@@ -68,4 +68,3 @@ with token_manager:
 ## License
 
 Apache 2.0 - See [LICENSE](LICENSE) for more information.
-
