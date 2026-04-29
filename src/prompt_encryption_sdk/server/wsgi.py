@@ -84,20 +84,13 @@ class PromptEncryptionWSGIMiddleware:
 
     return self.app(environ, start_response)
 
-  def _parse_request(
-      self, environ: dict[str, Any]
-  ) -> tuple[bytes, dict[str, Any]]:
-    """Parses the request body and returns the raw bytes and the JSON dict."""
+  def _parse_request(self, environ: dict[str, Any]) -> bytes:
+    """Parses the request body and returns the raw bytes."""
     try:
       request = werkzeug.wrappers.Request(environ)
-      data = request.get_json(force=True, silent=True) or {}
-      # Re-serialize to bytes for protobuf parsing if needed, or parse dict
-      # directly if supported.
-      # json_format.Parse accepts a string/bytes JSON representation.
-      body = json.dumps(data).encode("utf-8")
+      return request.get_data()
     except Exception:  # pylint: disable=broad-except
-      body, data = b"{}", {}
-    return body, data
+      return b"{}"
 
   def handle_attestation(
       self, environ: dict[str, Any], start_response
@@ -112,10 +105,12 @@ class PromptEncryptionWSGIMiddleware:
       An iterable of bytes representing the response body.
     """
     try:
-      body, data = self._parse_request(environ)
-      req = json_format.Parse(body, attestation_pb2.AttestConnectionRequest())
-
-      label = data.get("label", "EXPORTER-Prompt-Encryption-SDK")
+      body = self._parse_request(environ)
+      req = json_format.Parse(
+          body,
+          attestation_pb2.AttestConnectionRequest(),
+          ignore_unknown_fields=True,
+      )
 
       # Get socket from environ (injected by our patched gunicorn/worker)
       ssl_obj = environ.get("prompt_encryption.socket")
@@ -127,7 +122,7 @@ class PromptEncryptionWSGIMiddleware:
         )
 
       attestation_response_proto = self.attested_tls.attest_connection(
-          req, ssl_obj=ssl_obj, label=label
+          req, ssl_obj=ssl_obj
       )
       attestation_response_dict = json_format.MessageToDict(
           attestation_response_proto

@@ -54,7 +54,7 @@ class AttestedTlsImplTest(absltest.TestCase):
     )
 
     response = attested_tls_instance.attest_connection(
-        request, ssl_obj=mock_ssl_obj, label="test_label"
+        request, ssl_obj=mock_ssl_obj
     )
 
     with self.subTest(name="EvidencePopulated"):
@@ -96,7 +96,7 @@ class AttestedTlsImplTest(absltest.TestCase):
         " ssl_obj.export_keying_material failed.",
     ):
       attested_tls_instance.attest_connection(
-          request, ssl_obj=mock_ssl_obj, label="test_label"
+          request, ssl_obj=mock_ssl_obj
       )
     mock_export_keying_material.assert_called_once()
 
@@ -110,7 +110,7 @@ class AttestedTlsImplTest(absltest.TestCase):
         ValueError, "At least one required_verifier_type must be specified."
     ):
       attested_tls_instance.attest_connection(
-          request, ssl_obj=mock.MagicMock(), label="l"
+          request, ssl_obj=mock.MagicMock()
       )
 
   def test_attest_connection_unsupported_verifier(self):
@@ -137,7 +137,7 @@ class AttestedTlsImplTest(absltest.TestCase):
         ValueError, "Unsupported verifier types requested:"
     ):
       attested_tls_instance.attest_connection(
-          request, ssl_obj=mock_ssl_obj, label="l"
+          request, ssl_obj=mock_ssl_obj
       )
 
 

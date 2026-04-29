@@ -81,7 +81,6 @@ class MiddlewareTest(absltest.TestCase):
       self.mock_attested_tls.attest_connection.assert_called_once_with(
           request_proto,
           ssl_obj=self.ssl_obj,
-          label="EXPORTER-Prompt-Encryption-SDK",
       )
       calls = self.send.call_args_list
       self.assertEqual(calls[0].args[0]["type"], "http.response.start")
@@ -129,7 +128,7 @@ class MiddlewareTest(absltest.TestCase):
       await self.mw(scope, receive, self.send)
 
       self.mock_attested_tls.attest_connection.assert_called_once_with(
-          request_proto, ssl_obj=self.ssl_obj, label="my-custom-label"
+          request_proto, ssl_obj=self.ssl_obj,
       )
       calls = self.send.call_args_list
       self.assertEqual(calls[0].args[0]["type"], "http.response.start")

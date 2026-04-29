@@ -80,7 +80,6 @@ class PromptEncryptionWSGIMiddlewareTest(
     self.mock_attested_tls.attest_connection.assert_called_once_with(
         request_proto,
         ssl_obj=environ_overrides["prompt_encryption.socket"],
-        label="EXPORTER-Prompt-Encryption-SDK",
     )
     self.assertEqual(response.status_code, 200)
 

@@ -93,19 +93,12 @@ class PromptEncryptionASGIMiddleware:
     """
     request = requests.Request(scope, receive)
     raw_body = await request.body()
-    try:
-      decoded_body = raw_body.decode("utf-8")
-      data = json.loads(decoded_body)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-      data = {}
-
     req = json_format.Parse(
         raw_body,
         attestation_pb2.AttestConnectionRequest(),
         ignore_unknown_fields=True,
     )
 
-    label = data.get("label", "EXPORTER-Prompt-Encryption-SDK")
     extensions = scope.get("extensions", {})
     ssl_obj = extensions.get("tls_socket")
 
@@ -113,7 +106,7 @@ class PromptEncryptionASGIMiddleware:
       raise RuntimeError("TLS Socket not found.")
 
     attestation_response_proto = self.attested_tls.attest_connection(
-        req, ssl_obj=ssl_obj, label=label
+        req, ssl_obj=ssl_obj
     )
     attestation_response_dict = json_format.MessageToDict(
         attestation_response_proto

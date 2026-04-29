@@ -22,6 +22,7 @@ from prompt_encryption_sdk.proto import attestation_pb2
 from prompt_encryption_sdk.server import keys
 from prompt_encryption_sdk.server import token
 
+_EKM_LABEL = b"EXPORTER-Prompt-Encryption-SDK"
 
 class AttestedTLS:
   """Handles AttestConnection logic."""
@@ -37,7 +38,6 @@ class AttestedTLS:
       request: attestation_pb2.AttestConnectionRequest,
       *,
       ssl_obj: Any,
-      label: str,
   ) -> attestation_pb2.AttestConnectionResponse:
     """Processes the AttestConnectionRequest and returns an AttestConnectionResponse.
 
@@ -49,7 +49,6 @@ class AttestedTLS:
     Args:
       request: The AttestConnectionRequest message.
       ssl_obj: The SSL object from the TLS connection.
-      label: The label to use for EKM extraction.
 
     Returns:
       An AttestConnectionResponse message containing the attestation token and
@@ -62,8 +61,6 @@ class AttestedTLS:
     """
     if not request.required_verifier_type:
       raise ValueError("At least one required_verifier_type must be specified.")
-
-    label_bytes = label.encode("ascii")
     ekm_bytes = None
     first_ekm_exception = None
     # Attempt to extract EKM using the standard library.
@@ -73,7 +70,7 @@ class AttestedTLS:
     if hasattr(ssl_obj, "export_keying_material"):
       try:
         ekm_bytes = ssl_obj.export_keying_material(
-            label_bytes, 32, request.nonce
+            _EKM_LABEL, 32, context=request.nonce
         )
       except Exception as e:
         # If export_keying_material fails, we will try to extract EKM using
@@ -84,7 +81,10 @@ class AttestedTLS:
     if ekm_bytes is None:
       target_obj = getattr(ssl_obj, "_sslobj", ssl_obj)
       ekm_bytes = exporter.export_keying_material(
-          target_obj, 32, label_bytes, context=request.nonce
+          sock=target_obj,
+          length=32,
+          label=_EKM_LABEL,
+          context=request.nonce,
       )
 
     if ekm_bytes is None:
