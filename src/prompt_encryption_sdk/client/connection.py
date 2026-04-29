@@ -163,7 +163,7 @@ class AttestedHTTPSConnection(connection.HTTPSConnection):
 
       # E. Validate
       att_validator = self._attestation_validator_cls(self._policy)
-      att_validator.validate(attest_resp, tls_ekm)
+      att_validator.validate(attest_resp, tls_ekm, expected_nonce=nonce)
 
       # Update timestamp on success
       self._last_attestation_time = time.time()

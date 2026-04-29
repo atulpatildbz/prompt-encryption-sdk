@@ -45,15 +45,19 @@ _FAKE_INSTANCE_NAME = "mhv-test-atls2"
 _FAKE_INSTANCE_ID = "2725765997796889912"
 _FAKE_PUB_KEY = b"fake-ecdsa-public-key-bytes"
 _FAKE_SESSION_SIGNATURE = b"fake-session-signature"
+_FAKE_CHALLENGE_NONCE = b"0123456789abcdef0123456789abcdef"
 
 
-def _get_valid_claims() -> dict[str, Any]:
+def _get_valid_claims(nonce: bytes | None = None) -> dict[str, Any]:
   """Returns deterministic claims matching the GCA profile."""
-  expected_nonce = hashlib.sha256(_FAKE_PUB_KEY).hexdigest()
+  pub_key_nonce = hashlib.sha256(_FAKE_PUB_KEY).hexdigest()
+  eat_nonce_list = (
+      [pub_key_nonce, nonce.hex()] if nonce else [pub_key_nonce]
+  )
 
   return {
       "hwmodel": "GCP_AMD_SEV",
-      "eat_nonce": [expected_nonce],
+      "eat_nonce": eat_nonce_list,
       "submods": {
           "container": {
               "image_digest": _FAKE_IMAGE_HASH,
@@ -97,8 +101,8 @@ class AttestationValidatorTest(parameterized.TestCase):
 
   def test_verify_instance_key_binding_single_string_nonce(self):
     """Tests that validator handles 'eat_nonce' as a string instead of a list."""
-    expected_nonce = hashlib.sha256(_FAKE_PUB_KEY).hexdigest()
-    claims = {"eat_nonce": expected_nonce}
+    pub_key_nonce = hashlib.sha256(_FAKE_PUB_KEY).hexdigest()
+    claims = {"eat_nonce": pub_key_nonce}
     self.validator._verify_instance_key_binding(claims, _FAKE_PUB_KEY)
 
   def test_verify_instance_key_binding_fails_on_mismatch(self):
@@ -128,6 +132,24 @@ class AttestationValidatorTest(parameterized.TestCase):
     ):
       self.validator._verify_instance_key_binding(claims, _FAKE_PUB_KEY)
 
+  def test_verify_nonce_success(self):
+    """Tests that verification passes when the correct nonce is present."""
+    # We pass the nonce to the helper so it's included in the mock OIDC claims
+    claims = _get_valid_claims(nonce=_FAKE_CHALLENGE_NONCE)
+    self.validator._verify_instance_key_binding(
+        claims, _FAKE_PUB_KEY, expected_nonce=_FAKE_CHALLENGE_NONCE
+    )
+
+  def test_verify_nonce_fails_on_mismatch(self):
+    """Tests that verification fails if the challenge nonce is missing from the token."""
+    # Claims only contains the pubkey hash, simulating a replayed/stale token
+    claims = _get_valid_claims(nonce=None)
+    with self.assertRaisesRegex(
+        exceptions.AttestationVerificationError, "Nonce verification failed"
+    ):
+      self.validator._verify_instance_key_binding(
+          claims, _FAKE_PUB_KEY, expected_nonce=_FAKE_CHALLENGE_NONCE
+      )
   # --- 2. Policy Enforcement Tests ---
 
   @parameterized.named_parameters(
@@ -220,7 +242,7 @@ class AttestationValidatorTest(parameterized.TestCase):
             validator.OIDCTokenValidator, "validate_token", autospec=True
         )
     )
-    mock_oidc.return_value = _get_valid_claims()
+    mock_oidc.return_value = _get_valid_claims(nonce=_FAKE_CHALLENGE_NONCE)
     mock_verify_session_signature = self.enter_context(
         mock.patch.object(
             self.validator, "_verify_session_signature", autospec=True
@@ -242,9 +264,47 @@ class AttestationValidatorTest(parameterized.TestCase):
         ],
     )
 
-    self.validator.validate(response, tls_ekm=b"fake_ekm_material")
+    self.validator.validate(
+        response,
+        tls_ekm=b"fake_ekm_material",
+        expected_nonce=_FAKE_CHALLENGE_NONCE,
+    )
     mock_oidc.assert_called_once_with(mock.ANY, "valid.jwt.payload")
     mock_verify_session_signature.assert_called_once()
+
+  def test_validate_nonce_mismatch_fails(self):
+    """Tests that validate() raises an error if the challenge nonce is mismatched."""
+    mock_oidc = self.enter_context(
+        mock.patch.object(
+            validator.OIDCTokenValidator, "validate_token", autospec=True
+        )
+    )
+    # Return claims that do NOT contain the expected nonce
+    mock_oidc.return_value = _get_valid_claims(nonce=None)
+
+    response = attestation_pb2.AttestConnectionResponse(
+        instance_public_key=attestation_pb2.EcdsaP256PublicKey(
+            key_bytes=_FAKE_PUB_KEY
+        ),
+        session_signature=_FAKE_SESSION_SIGNATURE,
+        evidence=[
+            attestation_pb2.AttestationEvidence(
+                verifier_type=attestation_pb2.VerifierType.VERIFIER_TYPE_GCA,
+                gca_bundle=attestation_pb2.GcaTrustBundle(
+                    attestation_token="valid.jwt.payload"
+                ),
+            ),
+        ],
+    )
+
+    with self.assertRaisesRegex(
+        exceptions.AttestationVerificationError, "Nonce verification failed"
+    ):
+      self.validator.validate(
+          response,
+          tls_ekm=b"fake_ekm_material",
+          expected_nonce=_FAKE_CHALLENGE_NONCE,
+      )
 
   def test_validate_no_evidence_fails(self):
     """Tests failure when no attestation evidence is provided."""
@@ -431,7 +491,7 @@ class AttestationValidatorTest(parameterized.TestCase):
           with self.subTest(name="enforce_policy_called"):
             spy_policy.assert_called_once_with(claims)
           with self.subTest(name="verify_instance_key_binding_called"):
-            spy_binding.assert_called_once_with(claims, _FAKE_PUB_KEY)
+            spy_binding.assert_called_once_with(claims, _FAKE_PUB_KEY, expected_nonce=None)
           with self.subTest(name="verify_session_signature_called"):
             spy_sig.assert_called_once()
 

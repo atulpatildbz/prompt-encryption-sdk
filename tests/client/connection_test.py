@@ -261,11 +261,8 @@ class AttestedHTTPSConnectionTest(parameterized.TestCase):
     )
 
     # Verify validate was called with a Proto object and the EKM
-    mock_validator_inst.validate.assert_called_once_with(mock.ANY, b"fake_ekm")
-    # Ensure the first argument passed to validate is an AttestConnectionResponse
-    response_proto, _ = mock_validator_inst.validate.call_args.args
-    self.assertIsInstance(
-        response_proto, attestation_pb2.AttestConnectionResponse
+    mock_validator_inst.validate.assert_called_once_with(
+        mock.ANY, b"fake_ekm", expected_nonce=fixed_random_bytes
     )
 
     # Verify timestamp updated
