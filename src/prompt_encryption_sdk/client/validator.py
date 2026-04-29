@@ -43,9 +43,21 @@ _GCA_STRING_BY_HW_MODEL = types.MappingProxyType({
     attestation_pb2.HARDWARE_MODEL_SEV: "GCP_AMD_SEV",
     attestation_pb2.HARDWARE_MODEL_SEV_SNP: "GCP_AMD_SEV_SNP",
 })
-
-
 _GCE_POLICY_FIELDS = ("project_id", "zone", "instance_id", "instance_name")
+
+
+def _safe_get_map(data: Any, key: str) -> Mapping[str, Any]:
+  """Safely extracts a nested dictionary, verifying the type."""
+  if not isinstance(data, Mapping):
+    raise exceptions.AttestationVerificationError(
+        f"Expected mapping for claim structure, got {type(data).__name__}"
+    )
+  val = data.get(key, {})
+  if not isinstance(val, Mapping):
+    raise exceptions.AttestationVerificationError(
+        f"Claim {key!r} is not a mapping (got {type(val).__name__})"
+    )
+  return val
 
 
 class OIDCTokenValidator:
@@ -229,9 +241,12 @@ class AttestationValidator:
       return
 
     # Extract sub-sections for easier access based on GCA claim structure
-    submods = claims.get("submods", {})
-    container_claims = submods.get("container", {})
-    gce_claims = submods.get("gce", {})
+    try:
+      submods = _safe_get_map(claims, "submods")
+      container_claims = _safe_get_map(submods, "container")
+      gce_claims = _safe_get_map(submods, "gce")
+    except exceptions.AttestationVerificationError as e:
+      raise exceptions.PolicyViolationError(f"Malformed token structure: {e}") from e
 
     # 1. Hardware Model Validation
     # GCA Profile: 'hwmodel' claim contains the TEE type
@@ -240,6 +255,13 @@ class AttestationValidator:
       # Map Protocol Buffer Enum to GCA string representations
       # Example: HARDWARE_MODEL_SEV -> "GCP_AMD_SEV"
       expected_hw_string = _GCA_STRING_BY_HW_MODEL.get(self._policy.hw_model)
+
+      # Explicitly fail if the policy specifies a model unknown to the validator
+      if expected_hw_string is None:
+        raise exceptions.PolicyViolationError(
+            f"Policy requires hardware model {self._policy.hw_model}, "
+            "but this model is not supported by the validator."
+        )
 
       if token_hw != expected_hw_string:
         raise exceptions.PolicyViolationError(
@@ -263,6 +285,12 @@ class AttestationValidator:
       # Validates if any of the image signatures were produced by the trusted key
       if workload_policy.signing_key_id:
         signatures = container_claims.get("image_signatures", [])
+        if not isinstance(signatures, list) or not all(
+            isinstance(sig, Mapping) for sig in signatures
+        ):
+          raise exceptions.PolicyViolationError(
+              "Malformed image signatures claim."
+          )
         # Check if any signature key_id matches the policy
         found_key = any(
             sig.get("key_id") == workload_policy.signing_key_id

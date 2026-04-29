@@ -233,6 +233,66 @@ class AttestationValidatorTest(parameterized.TestCase):
     ):
       self.validator._enforce_policy(claims)
 
+  @parameterized.named_parameters(
+      (
+          "unknown_hw_model",
+          attestation_pb2.AttestationPolicy(hw_model=999),
+          {"hwmodel": None},
+          "not supported by the validator",
+      ),
+      (
+          "malformed_structure",
+          attestation_pb2.AttestationPolicy(),
+          {"submods": "malicious_string"},
+          "Malformed token structure",
+      ),
+      (
+          "missing_sub_mapping",
+          attestation_pb2.AttestationPolicy(),
+          {"submods": {"container": ["not", "a", "dict"]}},
+          "Malformed token structure",
+      ),
+      (
+          "malformed_image_signatures_type",
+          attestation_pb2.AttestationPolicy(
+              workload=attestation_pb2.WorkloadPolicy(
+                  signing_key_id=_FAKE_SIGNING_KEY
+              )
+          ),
+          {
+              "submods": {
+                  "container": {"image_signatures": "not_a_list"},
+                  "gce": {},
+              }
+          },
+          "Malformed image signatures claim.",
+      ),
+      (
+          "malformed_image_signatures_element_type",
+          attestation_pb2.AttestationPolicy(
+              workload=attestation_pb2.WorkloadPolicy(
+                  signing_key_id=_FAKE_SIGNING_KEY
+              )
+          ),
+          {
+              "submods": {
+                  "container": {"image_signatures": [123]},
+                  "gce": {},
+              }
+          },
+          "Malformed image signatures claim.",
+      ),
+  )
+  def test_enforce_policy_malformed_or_unsupported_fails(
+      self, policy, claims, expected_error
+  ):
+    """Verifies that unknown model or malformed/invalid claims trigger an error."""
+    self.validator._policy = policy
+    with self.assertRaisesRegex(
+        exceptions.PolicyViolationError, expected_error
+    ):
+      self.validator._enforce_policy(claims)
+
   # --- 3. Main Validation Orchestration Tests ---
 
   def test_validate_full_success(self):
