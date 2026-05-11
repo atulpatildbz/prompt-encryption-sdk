@@ -16,6 +16,8 @@ This SDK is particularly useful for protecting sensitive data, ensuring that pro
 - OpenSSL (for generating certificates if running a local test server)
 - A Google Cloud Project with Confidential Space enabled (for production server deployments)
 
+For more technical details on how the SDK works, see the [Architecture Documentation](ARCHITECTURE.md).
+
 ## Installation
 
 You can install the SDK directly from the source code.
