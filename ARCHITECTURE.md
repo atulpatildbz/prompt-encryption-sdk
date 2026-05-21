@@ -75,7 +75,7 @@ Client (urllib3/Pool)                           Server (TEE Workload)
 |                                 |                            |
 |                                 +--[3a] Derives EKM_svr (RFC 5705)
 |                                 +--[3b] Hardware signs Attestation Report (T_attest)
-|                                 +--[3c] Generates Payload = EKM_svr || SHA256(T_attest)
+|                                 +--[3c] Generates Payload = Protobuf(SHA256(EKM_svr), SHA256(T_attest))
 |                                 +--[3d] Computes Sig_session = Sign(PrivKey_instance, Payload)
 |                                                              |
 | [4] { T_attest, PubKey_instance, Sig_session }               |
@@ -102,7 +102,7 @@ The server maintains an ephemeral ECDSA P-256 key pair ($$K_{instance}$$), gener
 
 To prove possession of the key bound to the TEE, and to bind the hardware identity to the live TLS session, the server signs a specific payload using its private key $$PrivKey_{instance}$$:
 
-$$ Payload = EKM_{svr} \parallel SHA256(T_{attest}) $$
+$$ Payload = Protobuf(SHA256(EKM_{svr}), SHA256(T_{attest})) $$
 
 $$ Sig_{session} = Sign_{ECDSA-P256}(PrivKey_{instance}, Payload) $$
 ### Client-Side Attestation Verification
@@ -111,7 +111,7 @@ The core security of the SDK rests in the client's rigorous validation of the at
 1.  **EKM Derivation:** The client independently derives $$EKM_{client}$$. Due to TLS properties, $$EKM_{client} == EKM_{svr}$$ if and only if both parties share the exact same TLS Master Secret.
 2.  **Signature Chain Verification (Root of Trust):** The client fetches the JWKS from the configured OIDC Discovery URL and verifies the cryptographic signature of the JWT against the published public keys of the Root of Trust (e.g., Google Cloud Attestation).
 3.  **Instance Key Binding Verification:** The client computes $$Hash_{key} = SHA256(PubKey_{instance})$$. It extracts the `eat_nonce` claim from the verified OIDC JWT and asserts that $$Hash_{key} \in claims['eat_nonce']$$.
-4.  **TLS Session Binding Verification:** To prevent Attestation Replay and MitM attacks, the client binds the verified hardware identity to the live TLS socket. It reconstructs $$Payload_{client} = EKM_{client} \parallel SHA256(T_{attest})$$ and verifies the ECDSA P-256 signature ($$Sig_{session}$$) using $$PubKey_{instance}$$
+4.  **TLS Session Binding Verification:** To prevent Attestation Replay and MitM attacks, the client binds the verified hardware identity to the live TLS socket. It reconstructs $$Payload_{client} = Protobuf(SHA256(EKM_{client}), SHA256(T_{attest}))$$ and verifies the ECDSA P-256 signature ($$Sig_{session}$$) using $$PubKey_{instance}$$
 
 5.  **Policy Evaluation:** The client parses the claims structure to enforce user-defined policies against the `AttestationPolicy` protobuf:
 

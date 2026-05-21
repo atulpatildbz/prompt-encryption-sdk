@@ -25,6 +25,8 @@ from prompt_encryption_sdk.server import keys
 from prompt_encryption_sdk.server import token
 
 
+
+
 class AttestedTlsImplTest(absltest.TestCase):
 
   def test_attest_connection_success(self):
@@ -52,9 +54,19 @@ class AttestedTlsImplTest(absltest.TestCase):
         required_verifier_type=[attestation_pb2.VerifierType.VERIFIER_TYPE_GCA],
         nonce=b"test_nonce",
     )
+    expected_payload = attestation_pb2.SessionSignaturePayload(
+        ekm_hash=hashlib.sha256(ekm_bytes).digest(),
+        token_hash=hashlib.sha256(attestation_token).digest(),
+    )
 
     response = attested_tls_instance.attest_connection(
         request, ssl_obj=mock_ssl_obj
+    )
+
+    mock_token_manager.key_manager.sign_payload.assert_called_once()
+    call_args = mock_token_manager.key_manager.sign_payload.call_args[0][0]
+    actual_payload = attestation_pb2.SessionSignaturePayload.FromString(
+        call_args
     )
 
     with self.subTest(name="EvidencePopulated"):
@@ -66,11 +78,9 @@ class AttestedTlsImplTest(absltest.TestCase):
 
     with self.subTest(name="PublicKeyPopulated"):
       self.assertEqual(response.instance_public_key.key_bytes, public_key)
+
     with self.subTest(name="EKMSigned"):
-      mock_token_manager.key_manager.sign_payload.assert_called_once_with(
-          ekm_bytes
-          + hashlib.sha256(attestation_token).hexdigest().encode("utf-8")
-      )
+      compare.assertProto2Equal(self, expected_payload, actual_payload)
 
   @mock.patch.object(exporter, "export_keying_material", autospec=True)
   def test_attest_connection_ekm_extraction_fails(
@@ -95,9 +105,7 @@ class AttestedTlsImplTest(absltest.TestCase):
         "EKM extraction failed. The initial attempt using"
         " ssl_obj.export_keying_material failed.",
     ):
-      attested_tls_instance.attest_connection(
-          request, ssl_obj=mock_ssl_obj
-      )
+      attested_tls_instance.attest_connection(request, ssl_obj=mock_ssl_obj)
     mock_export_keying_material.assert_called_once()
 
   def test_attest_connection_no_verifier(self):
@@ -109,9 +117,7 @@ class AttestedTlsImplTest(absltest.TestCase):
     with self.assertRaisesRegex(
         ValueError, "At least one required_verifier_type must be specified."
     ):
-      attested_tls_instance.attest_connection(
-          request, ssl_obj=mock.MagicMock()
-      )
+      attested_tls_instance.attest_connection(request, ssl_obj=mock.MagicMock())
 
   def test_attest_connection_unsupported_verifier(self):
     mock_key_manager = mock.create_autospec(keys.KeyManager, instance=True)
@@ -136,9 +142,7 @@ class AttestedTlsImplTest(absltest.TestCase):
     with self.assertRaisesRegex(
         ValueError, "Unsupported verifier types requested:"
     ):
-      attested_tls_instance.attest_connection(
-          request, ssl_obj=mock_ssl_obj
-      )
+      attested_tls_instance.attest_connection(request, ssl_obj=mock_ssl_obj)
 
 
 if __name__ == "__main__":

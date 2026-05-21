@@ -14,6 +14,7 @@
 
 """Attested TLS logic for Prompt Encryption SDK."""
 
+import hashlib
 from typing import Any
 
 from absl import logging
@@ -100,9 +101,13 @@ class AttestedTLS:
         )
 
     public_key, attestation_token = self.token_manager.get_identity_snapshot()
-    token_hash = keys.calculate_fingerprint(attestation_token)
+    token_hash_bytes = hashlib.sha256(attestation_token).digest()
+    ekm_hash_bytes = hashlib.sha256(ekm_bytes).digest()
+    payload = attestation_pb2.SessionSignaturePayload(
+        ekm_hash=ekm_hash_bytes, token_hash=token_hash_bytes
+    )
     signature = self.token_manager.key_manager.sign_payload(
-        ekm_bytes + token_hash.encode("utf-8")
+        payload.SerializeToString()
     )
 
     if (
