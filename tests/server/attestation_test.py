@@ -144,6 +144,33 @@ class AttestedTlsImplTest(absltest.TestCase):
     ):
       attested_tls_instance.attest_connection(request, ssl_obj=mock_ssl_obj)
 
+  def test_attest_connection_mixed_verifier_types_fails(self):
+    mock_key_manager = mock.create_autospec(keys.KeyManager, instance=True)
+    mock_token_manager = mock.create_autospec(token.TokenManager, instance=True)
+    mock_token_manager.key_manager = mock_key_manager
+    mock_token_manager.get_identity_snapshot.return_value = (
+        b"pk",
+        b"token",
+    )
+    mock_token_manager.key_manager.sign_payload.return_value = b"sig"
+    mock_ssl_obj = mock.MagicMock()
+    mock_ssl_obj.export_keying_material.return_value = b"ekm"
+
+    attested_tls_instance = attestation.AttestedTLS(
+        token_manager=mock_token_manager
+    )
+    request = attestation_pb2.AttestConnectionRequest(
+        required_verifier_type=[
+            attestation_pb2.VerifierType.VERIFIER_TYPE_GCA,
+            attestation_pb2.VerifierType.VERIFIER_TYPE_UNSPECIFIED,
+        ]
+    )
+    with self.assertRaisesRegex(
+        ValueError, "Unsupported verifier types requested:"
+    ):
+      attested_tls_instance.attest_connection(request, ssl_obj=mock_ssl_obj)
+
+
 
 if __name__ == "__main__":
   absltest.main()

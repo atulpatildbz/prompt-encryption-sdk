@@ -110,14 +110,12 @@ class AttestedTLS:
         payload.SerializeToString()
     )
 
-    if (
-        attestation_pb2.VerifierType.VERIFIER_TYPE_GCA
-        not in request.required_verifier_type
-    ):
-      raise ValueError(
-          "Unsupported verifier types requested:"
-          f" {request.required_verifier_type}"
-      )
+    for verifier_type in request.required_verifier_type:
+      if verifier_type != attestation_pb2.VerifierType.VERIFIER_TYPE_GCA:
+        raise ValueError(
+            "Unsupported verifier types requested:"
+            f" {request.required_verifier_type}"
+        )
 
     response = attestation_pb2.AttestConnectionResponse(
         evidence=[
