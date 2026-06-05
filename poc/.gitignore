@@ -1,0 +1,10 @@
+# Rust build outputs
+target/
+Cargo.lock
+
+# Compiled wasm artifacts (regenerate with `cargo build --release --target wasm32-wasip1`)
+*.wasm
+
+# TLS certs incl. PRIVATE KEYS — never commit; regenerate via openssl (see poc2 RESULTS.md)
+certs
+certs/

@@ -1,0 +1,91 @@
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: 9901 }
+
+static_resources:
+  listeners:
+
+  # ---- Listener A :10000 — network WASM (write) + http WASM (read). Expect attested=PRESENT. ----
+  - name: with_write
+    address: { socket_address: { address: 0.0.0.0, port_value: 10000 } }
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.wasm
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.wasm.v3.Wasm
+          config:
+            name: writer
+            root_id: writer
+            vm_config:
+              runtime: envoy.wasm.runtime.v8
+              vm_id: attest_vm
+              code: { local: { filename: /etc/envoy/attest_filter.wasm } }
+            configuration:
+              "@type": type.googleapis.com/google.protobuf.StringValue
+              value: "write"
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: with_write
+          codec_type: HTTP2
+          route_config:
+            name: local
+            virtual_hosts:
+            - name: vh
+              domains: ["*"]
+              routes:
+              - match: { prefix: "/" }
+                direct_response: { status: 200, body: { inline_string: "ok\n" } }
+          http_filters:
+          - name: envoy.filters.http.wasm
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm
+              config:
+                name: reader
+                root_id: reader
+                vm_config:
+                  runtime: envoy.wasm.runtime.v8
+                  vm_id: attest_vm
+                  code: { local: { filename: /etc/envoy/attest_filter.wasm } }
+                configuration:
+                  "@type": type.googleapis.com/google.protobuf.StringValue
+                  value: "read"
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  # ---- Listener B :10001 — http WASM (read) ONLY, no network write. Expect attested=ABSENT. ----
+  - name: no_write
+    address: { socket_address: { address: 0.0.0.0, port_value: 10001 } }
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: no_write
+          codec_type: HTTP2
+          route_config:
+            name: local
+            virtual_hosts:
+            - name: vh
+              domains: ["*"]
+              routes:
+              - match: { prefix: "/" }
+                direct_response: { status: 200, body: { inline_string: "ok\n" } }
+          http_filters:
+          - name: envoy.filters.http.wasm
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm
+              config:
+                name: reader
+                root_id: reader
+                vm_config:
+                  runtime: envoy.wasm.runtime.v8
+                  vm_id: attest_vm
+                  code: { local: { filename: /etc/envoy/attest_filter.wasm } }
+                configuration:
+                  "@type": type.googleapis.com/google.protobuf.StringValue
+                  value: "read"
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
