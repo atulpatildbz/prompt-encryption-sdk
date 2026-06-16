@@ -137,7 +137,7 @@ gcloud compute instances create "${VM_NAME}" \
     --machine-type=a3-highgpu-1g \
     --confidential-compute-type=TDX \
     --maintenance-policy=TERMINATE \
-    --image-family=confidential-space-debug-preview-cgpu \
+    --image-family=confidential-space-debug \
     --image-project=confidential-space-images \
     --service-account="${SA_EMAIL}" \
     --scopes=cloud-platform \
