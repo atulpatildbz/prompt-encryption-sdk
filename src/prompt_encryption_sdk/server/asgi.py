@@ -14,6 +14,8 @@
 
 """ASGI middleware for handling attested TLS connections."""
 
+import http
+import json
 import logging
 import weakref
 from prompt_encryption_sdk.proto import attestation_pb2
@@ -79,7 +81,11 @@ class PromptEncryptionASGIMiddleware:
         await self.handle_attestation(scope, receive, send)
       except Exception as e:  # pylint: disable=broad-except
         logging.exception("Error during handling attest connection request")
-        status_code = 400 if isinstance(e, json_format.ParseError) else 500
+        status_code = (
+            http.HTTPStatus.BAD_REQUEST
+            if isinstance(e, json_format.ParseError)
+            else http.HTTPStatus.INTERNAL_SERVER_ERROR
+        )
         error_response = responses.JSONResponse(
             {"error": f"An internal server error occurred: {e!r}"},
             status_code=status_code,
@@ -110,8 +116,19 @@ class PromptEncryptionASGIMiddleware:
     """
     request = requests.Request(scope, receive)
     raw_body = await request.body()
-    req = json_format.Parse(
-        raw_body,
+
+    try:
+      parsed_json = json.loads(raw_body.decode("utf-8") if raw_body else "{}")
+    except json.JSONDecodeError as e:
+      raise json_format.ParseError("Invalid JSON") from e
+
+    if not isinstance(parsed_json, dict):
+      raise json_format.ParseError(
+          "Malformed JSON structure: Expected a dictionary"
+      )
+
+    req = json_format.ParseDict(
+        parsed_json,
         attestation_pb2.AttestConnectionRequest(),
         ignore_unknown_fields=True,
     )

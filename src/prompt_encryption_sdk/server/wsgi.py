@@ -122,8 +122,19 @@ class PromptEncryptionWSGIMiddleware:
     """
     try:
       body = self._parse_request(environ)
-      req = json_format.Parse(
-          body,
+
+      try:
+        parsed_json = json.loads(body.decode("utf-8") if body else "{}")
+      except json.JSONDecodeError as e:
+        raise json_format.ParseError("Invalid JSON") from e
+
+      if not isinstance(parsed_json, dict):
+        raise json_format.ParseError(
+            "Malformed JSON structure: Expected a dictionary"
+        )
+
+      req = json_format.ParseDict(
+          parsed_json,
           attestation_pb2.AttestConnectionRequest(),
           ignore_unknown_fields=True,
       )
