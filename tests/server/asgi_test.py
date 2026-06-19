@@ -19,6 +19,7 @@ import json
 from unittest import mock
 
 from absl.testing import absltest
+from absl.testing import parameterized
 from prompt_encryption_sdk.proto import attestation_pb2
 from prompt_encryption_sdk.server import asgi
 from prompt_encryption_sdk.server import attestation
@@ -29,7 +30,7 @@ import uvicorn
 from uvicorn.protocols.http import h11_impl
 
 
-class MiddlewareTest(absltest.TestCase):
+class MiddlewareTest(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()
@@ -41,12 +42,74 @@ class MiddlewareTest(absltest.TestCase):
     self.send = mock.AsyncMock()
     self.ssl_obj = mock.MagicMock()
 
-  def test_call_other_path(self):
+  def test_call_other_path_attested(self):
     async def run():
-      scope = {"type": "http", "path": "/other"}
+      self.mw._attested_sockets.add(self.ssl_obj)
+      scope = {
+          "type": "http",
+          "path": "/other",
+          "extensions": {"tls_socket": self.ssl_obj},
+      }
       receive = mock.AsyncMock()
       await self.mw(scope, receive, self.send)
+
       self.app.assert_called_once_with(scope, receive, self.send)
+
+    asyncio.run(run())
+
+  def test_call_other_path_unattested(self):
+    async def run():
+      scope = {
+          "type": "http",
+          "path": "/other",
+          "extensions": {"tls_socket": self.ssl_obj},
+      }
+      receive = mock.AsyncMock()
+      await self.mw(scope, receive, self.send)
+
+      self.app.assert_not_called()
+      expected_body = (
+          b'{"error":"Unauthorized: Connection must be attested first."}'
+      )
+      self.send.assert_has_calls([
+          mock.call({
+              "type": "http.response.start",
+              "status": 401,
+              "headers": [
+                  (b"content-length", b"60"),
+                  (b"content-type", b"application/json"),
+              ],
+          }),
+          mock.call({"type": "http.response.body", "body": expected_body}),
+      ])
+
+    asyncio.run(run())
+
+  def test_call_other_path_missing_socket(self):
+    async def run():
+      scope = {
+          "type": "http",
+          "path": "/other",
+          "extensions": {},
+      }
+      receive = mock.AsyncMock()
+      await self.mw(scope, receive, self.send)
+
+      self.app.assert_not_called()
+      expected_body = (
+          b'{"error":"Unauthorized: Connection must be attested first."}'
+      )
+      self.send.assert_has_calls([
+          mock.call({
+              "type": "http.response.start",
+              "status": 401,
+              "headers": [
+                  (b"content-length", b"60"),
+                  (b"content-type", b"application/json"),
+              ],
+          }),
+          mock.call({"type": "http.response.body", "body": expected_body}),
+      ])
 
     asyncio.run(run())
 
@@ -91,6 +154,7 @@ class MiddlewareTest(absltest.TestCase):
           json.loads(calls[1].args[0]["body"]),
           response_dict,
       )
+      self.assertIn(self.ssl_obj, self.mw._attested_sockets)
 
     asyncio.run(run())
 
@@ -128,7 +192,8 @@ class MiddlewareTest(absltest.TestCase):
       await self.mw(scope, receive, self.send)
 
       self.mock_attested_tls.attest_connection.assert_called_once_with(
-          request_proto, ssl_obj=self.ssl_obj,
+          request_proto,
+          ssl_obj=self.ssl_obj,
       )
       calls = self.send.call_args_list
       self.assertEqual(calls[0].args[0]["type"], "http.response.start")
@@ -139,6 +204,7 @@ class MiddlewareTest(absltest.TestCase):
           json.loads(calls[1].args[0]["body"]),
           response_dict,
       )
+      self.assertIn(self.ssl_obj, self.mw._attested_sockets)
 
     asyncio.run(run())
 

@@ -14,8 +14,8 @@
 
 """ASGI middleware for handling attested TLS connections."""
 
-import json
 import logging
+import weakref
 from prompt_encryption_sdk.proto import attestation_pb2
 from prompt_encryption_sdk.server import attestation
 from prompt_encryption_sdk.server import keys
@@ -23,9 +23,10 @@ from prompt_encryption_sdk.server import token
 from google.protobuf import json_format
 from starlette import requests
 from starlette import responses
-from uvicorn.config import Config
 import uvicorn
+from uvicorn.config import Config
 from uvicorn.protocols.http.h11_impl import H11Protocol
+
 
 class TlsInjectorProtocol(H11Protocol):
 
@@ -66,19 +67,35 @@ class PromptEncryptionASGIMiddleware:
   def __init__(self, app, attested_tls: attestation.AttestedTLS):
     self.app = app
     self.attested_tls = attested_tls
+    self._attested_sockets = weakref.WeakSet()
 
   async def __call__(self, scope, receive, send):
-    if scope["type"] == "http" and scope["path"] == "/_attest-connection":
+    if scope["type"] != "http":
+      await self.app(scope, receive, send)
+      return
+
+    if scope["path"] == "/_attest-connection":
       try:
         await self.handle_attestation(scope, receive, send)
       except Exception as e:  # pylint: disable=broad-except
         logging.exception("Error during handling attest connection request")
         status_code = 400 if isinstance(e, json_format.ParseError) else 500
         error_response = responses.JSONResponse(
-            {"error": f"An internal server error occurred: {repr(e)}"},
+            {"error": f"An internal server error occurred: {e!r}"},
             status_code=status_code,
         )
         await error_response(scope, receive, send)
+      return
+
+    extensions = scope.get("extensions", {})
+    ssl_obj = extensions.get("tls_socket")
+    # NOMUTANTS -- Equivalent mutation: None not in WeakSet evaluates to True.
+    if not ssl_obj or ssl_obj not in self._attested_sockets:
+      error_response = responses.JSONResponse(
+          {"error": "Unauthorized: Connection must be attested first."},
+          status_code=401,
+      )
+      await error_response(scope, receive, send)
       return
 
     await self.app(scope, receive, send)
@@ -108,6 +125,7 @@ class PromptEncryptionASGIMiddleware:
     attestation_response_proto = self.attested_tls.attest_connection(
         req, ssl_obj=ssl_obj
     )
+    self._attested_sockets.add(ssl_obj)
     attestation_response_dict = json_format.MessageToDict(
         attestation_response_proto
     )
