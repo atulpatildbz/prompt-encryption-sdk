@@ -158,7 +158,7 @@ class AttestedHTTPSConnection(connection.HTTPSConnection):
 
       # D. Export Keying Material
       tls_ekm = self._ekm_exporter_fn(
-          self.sock, constants.EKM_LENGTH, constants.EKM_LABEL, context=nonce  # pyrefly: ignore[bad-argument-type]
+          self.sock, constants.EKM_LENGTH, constants.EKM_LABEL, context=nonce
       )
 
       # E. Validate
@@ -257,7 +257,7 @@ class AttestedHTTPSConnection(connection.HTTPSConnection):
 class AttestedHTTPSConnectionPool(connectionpool.HTTPSConnectionPool):
   """Pool that spawns AttestedHTTPSConnections."""
 
-  ConnectionCls = AttestedHTTPSConnection  # pyrefly: ignore[bad-assignment]
+  ConnectionCls = AttestedHTTPSConnection
 
   def __init__(
       self,
